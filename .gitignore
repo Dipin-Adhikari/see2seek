@@ -1,1 +1,6 @@
 minorenv/
+see2seek.egg-info/
+__pycache__/
+*.pyc
+imgs/
+test.ipynb
