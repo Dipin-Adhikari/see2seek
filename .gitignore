@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 imgs/
 test.ipynb
+imagenav_dataset/
+test.py
