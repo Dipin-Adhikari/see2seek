@@ -26,9 +26,9 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "train"                    # "train" | "val" | "test"
-    scene_dataset_path: str = "data/scene_datasets/robothor"
-    episodes_path: str = "data/datasets/imagenav/robothor/v1/train/train.json.gz"
+    split: str = "debug"                    # "train" | "val" | "test"
+    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug"
+    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -54,7 +54,7 @@ class EnvConfig:
     max_steps: int = 500
 
     # --- Parallelism ---
-    num_envs: int = 16                     # number of parallel rollout workers
+    num_envs: int = 1                     # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ class EncoderConfig:
 
     # --- Observation encoder: DINOv2 ViT-B/14 ---
     obs_encoder: str = "dinov2_vitb14"     # torch.hub model name
-    obs_embed_dim: int = 512               # DINOv2 ViT-B output dim (CLS token)
+    obs_embed_dim: int = 768               # DINOv2 ViT-B output dim (CLS token)
     obs_freeze: bool = True                # always frozen; never fine-tuned
     obs_normalize: bool = True             # ImageNet-style normalisation
 
@@ -132,7 +132,7 @@ class PPOConfig:
     entropy_coef: float = 0.01            # entropy bonus coefficient
 
     # --- Training length ---
-    total_num_steps: int = 75_000_000     # total env steps (≈ ZSON scale-down)
+    total_num_steps: int = 750     # total env steps (≈ ZSON scale-down)
     checkpoint_interval: int = 500_000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
 

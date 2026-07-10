@@ -1,0 +1,382 @@
+"""
+ppo_trainer.py — Proximal Policy Optimisation trainer for recurrent policies.
+
+Implements the full training loop:
+    1. Collect `num_steps` steps from `num_envs` parallel environments.
+    2. Encode observations and goals with frozen encoders (DINOv2 + CLIP).
+    3. Compute GAE returns and advantages.
+    4. Run `num_epochs` epochs of mini-batch PPO updates.
+    5. Log to W&B and save checkpoints.
+
+The PPO loss has three terms:
+    L = L_policy + value_loss_coef * L_value - entropy_coef * H[π]
+
+    L_policy = -E[ min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t) ]
+               where r_t = π(a_t|s_t) / π_old(a_t|s_t)
+
+    L_value  = MSE( V(s_t) , R_t )
+
+    H[π]     = -E[ π log π ]   (encourages exploration)
+
+Usage:
+    trainer = PPOTrainer(cfg)
+    trainer.train()
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+# from turtle import done
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from see2seek.utils.config import Config
+from see2seek.models.encoders.dino_encoder import DINOv2Encoder
+from see2seek.models.encoders.clip_encoder import CLIPGoalEncoder
+from see2seek.envs.vec_env import make_vec_envs
+from see2seek.agents.gru_policy import build_policy
+from see2seek.buffers.rollout_buffer import RolloutBuffer
+
+logger = logging.getLogger(__name__)
+
+
+class PPOTrainer:
+    """
+    Full PPO training loop with recurrent GRU policy.
+
+    Args:
+        cfg:      Config dataclass (from configs/config.py).
+        resume:   Path to a checkpoint to resume from, or None.
+    """
+
+    def __init__(self, cfg: Config, resume: Optional[str] = None) -> None:
+        self.cfg = cfg
+        self.device = torch.device(cfg.device)
+
+        # ---- Logging ----
+        self._setup_logging()
+
+        # ---- Encoders (frozen, shared across all updates) ----
+        logger.info("Building encoders ...")
+        self.obs_encoder  = DINOv2Encoder(
+            device=cfg.device,
+            normalize=cfg.encoder.obs_normalize,
+        )
+        self.goal_encoder = CLIPGoalEncoder(
+            device=cfg.device,
+            normalize=cfg.encoder.goal_normalize,
+        )
+
+
+        # ---- Policy (trainable) ----
+        logger.info("Building GRU Actor-Critic policy ...")
+        self.policy = build_policy(cfg, cfg.device)
+
+        # ---- Optimiser ----
+        self.optimiser = torch.optim.Adam(
+            self.policy.parameters(),
+            lr=cfg.ppo.lr,
+            eps=cfg.ppo.eps,
+        )
+
+        # ---- Environments ----
+        logger.info(f"Launching {cfg.env.num_envs} parallel environments ...")
+        self.vec_env = make_vec_envs(cfg)
+
+        # ---- Rollout buffer ----
+        self.buffer = RolloutBuffer(
+            num_steps=cfg.ppo.num_steps,
+            num_envs=cfg.env.num_envs,
+            obs_dim=cfg.encoder.obs_embed_dim,
+            goal_dim=cfg.encoder.goal_embed_dim,
+            hidden_size=cfg.policy.hidden_size,
+            num_actions=cfg.env.num_actions,
+            device=self.device,
+        )
+
+        # ---- Training state ----
+        self._total_steps = 0
+        self._num_updates = 0
+        self._start_time  = time.time()
+
+        # Resume from checkpoint if provided
+        if resume is not None:
+            self._load_checkpoint(resume)
+
+        logger.info("PPOTrainer initialised and ready.")
+
+    # ------------------------------------------------------------------
+    # Setup helpers
+    # ------------------------------------------------------------------
+
+    def _setup_logging(self) -> None:
+        """Initialise W&B if enabled."""
+        if self.cfg.logging.use_wandb:
+            try:
+                import wandb
+                wandb.init(
+                    project=self.cfg.logging.wandb_project,
+                    entity=self.cfg.logging.wandb_entity,
+                    name=self.cfg.logging.run_name,
+                    config={
+                        "env":     vars(self.cfg.env),
+                        "encoder": vars(self.cfg.encoder),
+                        "policy":  vars(self.cfg.policy),
+                        "ppo":     vars(self.cfg.ppo),
+                    },
+                )
+                self._wandb = wandb
+                logger.info("W&B initialised")
+            except ImportError:
+                logger.warning("wandb not installed — skipping W&B logging")
+                self._wandb = None
+        else:
+            self._wandb = None
+
+    def _setup_checkpoint_dir(self) -> None:
+        os.makedirs(self.cfg.logging.checkpoint_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
+    def train(self) -> None:
+        """Run the full PPO training loop until total_num_steps is reached."""
+        cfg = self.cfg
+        self._setup_checkpoint_dir()
+
+        logger.info("=== Starting training ===")
+        logger.info(f"  Total env steps : {cfg.ppo.total_num_steps:,}")
+        logger.info(f"  Num envs        : {cfg.env.num_envs}")
+        logger.info(f"  Steps per rollout: {cfg.ppo.num_steps}")
+
+        # Reset all environments and get initial observations
+        obs_dict = self.vec_env.reset_all()
+        # obs_dict["rgb"]  : (N, 3, H, W) on CPU
+        # obs_dict["goal"] : (N, 3, H, W) on CPU
+
+        # Initial hidden state (all zeros at training start)
+        hidden = self.policy.get_initial_hidden(cfg.env.num_envs, self.device)
+        masks  = torch.ones(cfg.env.num_envs, 1, device=self.device)
+        prev_actions = torch.full(
+            (cfg.env.num_envs,), cfg.env.num_actions, dtype=torch.long, device=self.device
+        )   # num_actions index = "no previous action" padding
+
+        while self._total_steps < cfg.ppo.total_num_steps:
+            # ---- Phase 1: Collect rollout ----
+            self.policy.eval()    # eval for rollout (no dropout)
+            collect_start = time.time()
+
+            for _ in range(cfg.ppo.num_steps):
+                with torch.no_grad():
+                    # 1a. Encode observation (DINOv2 — frozen)
+                    rgb = obs_dict["rgb"].to(self.device)          # (N, 3, H, W)
+                    obs_embed = self.obs_encoder(rgb)              # (N, 512)
+
+                    # 1b. Encode goal (CLIP — frozen; cached)
+                    goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
+
+                    # 1c. Policy forward
+                    dist, value, hidden_next = self.policy.act(
+                        obs_embed, goal_embed, prev_actions, hidden, masks
+                    )
+                    actions   = dist.sample()                      # (N,)
+                    log_probs = dist.log_prob(actions)             # (N,)
+
+                # 1d. Step environments
+                obs_dict, rewards, dones, infos = self.vec_env.step(actions)
+                rewards = rewards.to(self.device)
+
+                # 1e. Build masks for NEXT step (0 if this step was terminal)
+                new_masks = (~dones).float().unsqueeze(1).to(self.device)  # (N, 1)
+
+                # 1f. Insert into buffer
+                self.buffer.insert(
+                    obs_embed   = obs_embed,
+                    goal_embed  = goal_embed,
+                    action      = actions,
+                    prev_action = prev_actions,
+                    reward      = rewards,
+                    mask        = new_masks.squeeze(1),
+                    value       = value.squeeze(-1),
+                    log_prob    = log_probs,
+                    hidden      = hidden,
+                )
+
+                # 1g. Update recurrent state
+                hidden       = hidden_next * new_masks.unsqueeze(0)
+                prev_actions = actions
+                masks        = new_masks
+                self._total_steps += cfg.env.num_envs
+
+            # ---- Phase 2: Compute returns ----
+            with torch.no_grad():
+                rgb = obs_dict["rgb"].to(self.device)
+                obs_embed  = self.obs_encoder(rgb)
+                goal_embed = self._get_goal_embeddings(obs_dict)
+                _, last_value, _ = self.policy.act(
+                    obs_embed, goal_embed, prev_actions, hidden, masks
+                )
+
+            self.buffer.compute_returns(
+                last_value  = last_value.squeeze(-1),
+                gamma       = cfg.ppo.gamma,
+                gae_lambda  = cfg.ppo.gae_lambda,
+            )
+
+            # ---- Phase 3: PPO update ----
+            self.policy.train()
+            update_metrics = self._ppo_update()
+            self._num_updates += 1
+
+            # ---- Phase 4: Carry state forward ----
+            self.buffer.after_update(hidden, masks.squeeze(1))
+
+            # ---- Logging ----
+            if self._num_updates % cfg.ppo.log_interval == 0:
+                self._log(update_metrics, collect_start)
+
+            # ---- Checkpointing ----
+            if self._total_steps % cfg.ppo.checkpoint_interval < (
+                cfg.ppo.num_steps * cfg.env.num_envs
+            ):
+                self._save_checkpoint()
+
+        # Final checkpoint
+        self._save_checkpoint(final=True)
+        self.vec_env.close()
+        logger.info("=== Training complete ===")
+
+    # ------------------------------------------------------------------
+    # PPO update
+    # ------------------------------------------------------------------
+
+    def _ppo_update(self) -> dict:
+        """
+        Run num_epochs epochs of PPO updates over the current rollout buffer.
+
+        Returns:
+            Dict of mean losses for logging.
+        """
+        cfg = self.cfg
+        metrics = {"policy_loss": 0., "value_loss": 0., "entropy": 0., "total_loss": 0.}
+        num_batches = 0
+
+        for _ in range(cfg.ppo.num_epochs):
+            for batch in self.buffer.recurrent_mini_batches(cfg.ppo.num_mini_batches):
+
+                # Re-evaluate actions under current policy
+                log_probs, values, entropy = self.policy.evaluate_actions(
+                    obs_embed    = batch.obs_embeds,
+                    goal_embed   = batch.goal_embeds,
+                    prev_actions = batch.prev_actions,
+                    hidden       = batch.hidden_states,
+                    masks        = batch.masks,
+                    actions      = batch.actions,
+                )
+
+                # PPO clipped policy loss
+                ratio = torch.exp(log_probs - batch.old_log_probs)
+                surr1 = ratio * batch.advantages
+                surr2 = torch.clamp(ratio, 1 - cfg.ppo.clip_param, 1 + cfg.ppo.clip_param) * batch.advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Value loss (MSE)
+                value_loss = F.mse_loss(values.squeeze(-1), batch.returns)
+
+                # Total loss
+                loss = (
+                    policy_loss
+                    + cfg.ppo.value_loss_coef * value_loss
+                    - cfg.ppo.entropy_coef    * entropy
+                )
+
+                # Gradient step
+                self.optimiser.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.ppo.max_grad_norm)
+                self.optimiser.step()
+
+                metrics["policy_loss"] += policy_loss.item()
+                metrics["value_loss"]  += value_loss.item()
+                metrics["entropy"]     += entropy.item()
+                metrics["total_loss"]  += loss.item()
+                num_batches += 1
+
+        # Average over all batches
+        for k in metrics:
+            metrics[k] /= max(num_batches, 1)
+
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Goal embedding helper
+    # ------------------------------------------------------------------
+
+    def _get_goal_embeddings(self, obs_dict: dict) -> torch.Tensor:
+        """
+        Fetches the pre-calculated 512-d goal embedding directly from the environment.
+        """
+        return obs_dict["goal"].to(self.device)
+        # ------------------------------------------------------------------
+        # Checkpoint I/O
+        # ------------------------------------------------------------------
+
+    def _save_checkpoint(self, final: bool = False) -> None:
+        """Save policy weights, optimiser state, and training metadata."""
+        suffix = "final" if final else f"{self._total_steps:012d}"
+        path = os.path.join(
+            self.cfg.logging.checkpoint_dir,
+            f"checkpoint_{suffix}.pth"
+        )
+        torch.save({
+            "policy_state_dict":    self.policy.state_dict(),
+            "optimiser_state_dict": self.optimiser.state_dict(),
+            "total_steps":          self._total_steps,
+            "num_updates":          self._num_updates,
+            "cfg":                  self.cfg,
+        }, path)
+        logger.info(f"Checkpoint saved: {path}")
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Load a previously saved checkpoint."""
+        logger.info(f"Resuming from checkpoint: {path}")
+        ckpt = torch.load(path, map_location=self.device)
+        self.policy.load_state_dict(ckpt["policy_state_dict"])
+        self.optimiser.load_state_dict(ckpt["optimiser_state_dict"])
+        self._total_steps = ckpt.get("total_steps", 0)
+        self._num_updates = ckpt.get("num_updates", 0)
+        logger.info(f"Resumed at step {self._total_steps:,}")
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _log(self, metrics: dict, collect_start: float) -> None:
+        """Log training metrics to console and W&B."""
+        elapsed    = time.time() - self._start_time
+        steps_ps   = self._total_steps / max(elapsed, 1)
+        fps        = (self.cfg.ppo.num_steps * self.cfg.env.num_envs) / (time.time() - collect_start)
+
+        logger.info(
+            f"[{self._total_steps:>10,} steps | update {self._num_updates:>5}] "
+            f"policy_loss={metrics['policy_loss']:.4f}  "
+            f"value_loss={metrics['value_loss']:.4f}  "
+            f"entropy={metrics['entropy']:.4f}  "
+            f"fps={fps:.0f}"
+        )
+
+        if self._wandb is not None:
+            self._wandb.log({
+                "train/policy_loss": metrics["policy_loss"],
+                "train/value_loss":  metrics["value_loss"],
+                "train/entropy":     metrics["entropy"],
+                "train/total_loss":  metrics["total_loss"],
+                "train/fps":         fps,
+                "train/total_steps": self._total_steps,
+            })

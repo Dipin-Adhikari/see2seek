@@ -21,7 +21,7 @@ Reward structure:
 
 Usage:
     env = RoboTHOREnv(cfg)
-    obs_dict = env.reset()           
+    obs_dict = env.reset()
     obs_dict, reward, done, info = env.step(action_int)
     env.close()
 """
@@ -83,38 +83,33 @@ class RoboTHOREnv:
             transforms.ToTensor(),
         ])
 
-        # 1. Auto-detect the current dataset split context from the input path
-        self._split = "debug"
-        # for s in ["debug", "train", "val"]:
-        #     if s in cfg.env.episodes_path.split(os.sep):
-        #         self._split = s
-        #         break
+        # 1. Grab split dynamically from config
+        self._split = cfg.env.split
 
-        # 2. Locate and load the pre-cached embeddings dictionary map (.pt)
-        # Assumes embeddings.pt is stored in the root directory of the split (e.g. dataset/debug/embeddings.pt)
-        path_dir = os.path.dirname(cfg.env.episodes_path)
-        while path_dir and os.path.basename(path_dir) != self._split:
-            parent = os.path.dirname(path_dir)
-            if parent == path_dir:
-                break
-            path_dir = parent
+        # 2. Load the pre-cached embeddings dictionary map (.pt)
+        # scene_dataset_path IS the split folder (e.g. .../imagenav_dataset/debug)
+        embeddings_path = os.path.join(cfg.env.scene_dataset_path, "embeddings.pt")
 
-        embeddings_path = os.path.join(path_dir, "embeddings.pt")
         if os.path.exists(embeddings_path):
             logger.info(f"📂 Loading cached CLIP embeddings registry from: {embeddings_path}")
             self._embeddings_registry = torch.load(embeddings_path, map_location="cpu")
         else:
             raise FileNotFoundError(f"❌ Required pre-cached embeddings file missing at: {embeddings_path}")
 
-        # Load your customized JSON/JSON.GZ data structures
+        # 3. Load episodes. episodes_path may point at:
+        #      - a single .json / .json.gz file, OR
+        #      - a directory containing one or more per-scene files
+        #    (see _load_episodes for directory-handling / de-dup logic)
         self._episodes: List[Dict] = self._load_episodes(
             cfg.env.episodes_path, episode_ids
         )
+
         self._episode_index: int = 0
         random.shuffle(self._episodes)
 
         # Current episode state variables
         self._current_episode: Optional[Dict] = None
+        self._cached_goal_embedding: Optional[torch.Tensor] = None
         self._prev_geodesic_dist: float = 0.0
         self._num_steps: int = 0
 
@@ -135,23 +130,25 @@ class RoboTHOREnv:
         except ImportError as e:
             raise ImportError("ai2thor is required: pip install ai2thor") from e
 
-        # 1. Use CloudRendering if headless=True, otherwise let it open normally
+        # Use CloudRendering if headless=True, otherwise let it open normally
         platform_setting = CloudRendering if (not self._render) else None
 
         self._controller = Controller(
-            agentMode="locobot",  # 2. FIX: Must be "locobot" for RoboTHOR scenes
+            agentMode="locobot",  # must be "locobot" for RoboTHOR scenes
             visibilityDistance=1.5,
-            scene="FloorPlan_Train1_1", 
+            scene="FloorPlan_Train1_1",
             gridSize=self.cfg.env.move_magnitude,
             rotateStepDegrees=self.cfg.env.rotate_degrees,
+            snapToGrid=False,
             renderDepthImage=self.cfg.env.depth_sensor,
             renderInstanceSegmentation=False,
             width=self.cfg.env.image_width,
             height=self.cfg.env.image_height,
             fieldOfView=79,
             port=8200 + self._worker_id,
-            headless=(not self._render),
-            platform=platform_setting,  # 3. FIX: Add platform tracking parameter
+            # headless=(not self._render),
+            # gpu_device=0,
+            # platform=platform_setting,
         )
 
     def _load_episodes(
@@ -160,30 +157,53 @@ class RoboTHOREnv:
         episode_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
         """
-        Load episode definitions from a .json or .json.gz file.
-        Handles both a direct list of episodes or a dict wrapping an 'episodes' key.
+        Load episode definitions from either:
+          - a single .json / .json.gz file, or
+          - a directory containing one or more per-scene .json/.json.gz files.
+
+        When a directory is given and a scene has BOTH a .json and a .json.gz
+        version (as in the debug set), only the .json.gz is loaded so episodes
+        aren't duplicated.
         """
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Episodes file not found: {path}")
+            raise FileNotFoundError(f"Episodes path not found: {path}")
 
-        if path.endswith(".gz"):
-            with gzip.open(path, "rt", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            with open(path, "r") as f:
-                data = json.load(f)
-
-        # FIX: Check if the top-level structure is a list or a dict
-        if isinstance(data, list):
-            episodes = data
-        elif isinstance(data, dict):
-            if "episodes" in data:
-                episodes = data["episodes"]
+        def _read_one(fp: str) -> List[Dict]:
+            if fp.endswith(".gz"):
+                with gzip.open(fp, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
             else:
-                # Fallback if the dict itself represents a single episode wrapper
-                episodes = [data]
+                with open(fp, "r") as f:
+                    data = json.load(f)
+
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return data.get("episodes", [data])
+            else:
+                raise ValueError(f"Unexpected JSON data format in {fp}. Expected list or dict.")
+
+        episodes: List[Dict] = []
+
+        if os.path.isdir(path):
+            # stem -> filepath, preferring .json.gz over .json for the same stem
+            files: Dict[str, str] = {}
+            for fname in sorted(os.listdir(path)):
+                if fname.endswith(".json.gz"):
+                    stem = fname[: -len(".json.gz")]
+                    files[stem] = os.path.join(path, fname)
+            for fname in sorted(os.listdir(path)):
+                if fname.endswith(".json") and not fname.endswith(".json.gz"):
+                    stem = fname[: -len(".json")]
+                    files.setdefault(stem, os.path.join(path, fname))  # skip if .gz already claimed it
+
+            if not files:
+                raise FileNotFoundError(f"No .json/.json.gz episode files found in directory: {path}")
+
+            for fp in files.values():
+                episodes.extend(_read_one(fp))
         else:
-            raise ValueError(f"Unexpected JSON data format in {path}. Expected list or dict.")
+            episodes.extend(_read_one(path))
 
         # Filter by specific IDs if requested
         if episode_ids is not None:
@@ -219,25 +239,51 @@ class RoboTHOREnv:
         scene = ep["scene"]
 
         # 1. Reset simulator framework window state target
-        self._controller.reset(scene=scene)
-        
+        event = self._controller.reset(scene=scene)
+
+        # CloudRendering can return a None frame on the very first event while
+        # the render server is still warming up (common on weaker/laptop GPUs).
+        # Force a few no-op steps until a real frame comes back.
+        retries = 0
+        max_retries = 5
+        while event.frame is None and retries < max_retries:
+            event = self._controller.step(action="Pass")
+            retries += 1
+
+        if event.frame is None:
+            raise RuntimeError(
+                f"Renderer failed to produce a frame after {retries} retries "
+                f"(scene={scene}). Check CloudRendering / GPU setup."
+            )
+
         # 2. Build rotation payload matching AI2-THOR API parameters (Yaw mapping)
         start_rotation = {"x": 0, "y": ep.get("initial_orientation", 0.0), "z": 0}
-        
-        self._controller.step(
+
+        event = self._controller.step(
             action="TeleportFull",
             position=ep["initial_position"],
             rotation=start_rotation,
             horizon=ep.get("initial_horizon", 0),
-            # standing=True,
         )
+
+        if not event.metadata.get("lastActionSuccess", True):
+            raise RuntimeError(
+                f"TeleportFull failed for scene={scene}, "
+                f"position={ep['initial_position']}, rotation={start_rotation}: "
+                f"{event.metadata.get('errorMessage')}"
+            )
+
+        if event.frame is None:
+            raise RuntimeError(
+                f"TeleportFull succeeded but returned no frame (scene={scene})"
+            )
 
         # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
         goal_pos = ep["shortest_path"][-1]
         self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
 
         # 4. Fetch the environment state observations
-        rgb = self._get_rgb_tensor()
+        rgb = self._get_rgb_tensor(event.frame)
         goal_embedding = self._load_goal_embedding(ep)
 
         return {"rgb": rgb, "goal": goal_embedding}
@@ -255,15 +301,25 @@ class RoboTHOREnv:
             done, success = self._handle_stop()
             reward = self.cfg.env.success_reward if success else 0.0
             info = self._build_info(success, done)
-            obs = {"rgb": self._get_rgb_tensor(), "goal": self._get_cached_goal()}
+            obs = {
+                "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
+                "goal": self._get_cached_goal(),
+            }
             return obs, reward, done, info
 
-        self._controller.step(action=action_name)
+        event = self._controller.step(action=action_name)
+
+        if not event.metadata.get("lastActionSuccess", True):
+            logger.warning(
+                f"Action '{action_name}' failed at step {self._num_steps} "
+                f"(episode={self._current_episode.get('id', '?')}): "
+                f"{event.metadata.get('errorMessage')}"
+            )
 
         # Track trajectory progress rewards toward destination coordinate targets
         goal_pos = self._current_episode["shortest_path"][-1]
         curr_dist = self._get_geodesic_distance(goal_pos)
-        
+
         reward = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
         reward += self.cfg.env.slack_reward
         self._prev_geodesic_dist = curr_dist
@@ -272,7 +328,7 @@ class RoboTHOREnv:
         done = self._num_steps >= self.cfg.env.max_steps
         info = self._build_info(success=False, done=done)
 
-        obs = {"rgb": self._get_rgb_tensor(), "goal": self._get_cached_goal()}
+        obs = {"rgb": self._get_rgb_tensor(event.frame), "goal": self._get_cached_goal()}
         return obs, reward, done, info
 
     def close(self) -> None:
@@ -304,26 +360,51 @@ class RoboTHOREnv:
         ])
         return float(dist)
 
-    def _get_rgb_tensor(self) -> torch.Tensor:
-        frame = self._controller.last_event.frame
+    def _get_rgb_tensor(self, frame: Optional[np.ndarray] = None) -> torch.Tensor:
+        """
+        Convert a raw AI2-THOR RGB frame (HxWx3 uint8 array) into a
+        normalized model-ready tensor.
+
+        Args:
+            frame: Optional frame array. If not provided, falls back to
+                self._controller.last_event.frame (kept for backward
+                compatibility with any other call sites).
+        """
+        if frame is None:
+            frame = self._controller.last_event.frame
+
+        if frame is None:
+            raise RuntimeError(
+                "Controller returned no frame — renderer may not be initialised "
+                "or the last action may have failed silently."
+            )
+
         pil = Image.fromarray(frame)
         return self._transform(pil)
 
     def _load_goal_embedding(self, ep: Dict) -> torch.Tensor:
-        """Resolves embedding references using localized filename lookups against the registry map."""
-        # Cleans out path modifiers like "../images/id_xxx.png" to extract "id_xxx.png"
+        """
+        Resolves embedding references against the registry map.
+
+        Confirmed key format (verified against embeddings.pt on 2026-07-10):
+            "<split>/images/<basename of goal_image_path>"
+        e.g. "debug/images/id_000000_FloorPlan_Train1_1_..._goal.png"
+
+        Requires cfg.env.split to match the actual split folder name
+        (e.g. "debug") — the default in config.py is "train", so make sure
+        it's overridden for debug runs or this will raise KeyError below.
+        """
         filename = os.path.basename(ep.get("goal_image_path", ""))
-        
-        # Constructs the precise dictionary key matching your registry generation code structure
         lookup_key = f"{self._split}/images/{filename}"
 
-        if lookup_key in self._embeddings_registry:
-            # Yields precalculated 512-dimension vector tensor directly
-            self._cached_goal_embedding = self._embeddings_registry[lookup_key]
-        else:
-            logger.warning(f"⚠️ Target key index '{lookup_key}' missing inside current embedding.pt file layout structure.")
-            self._cached_goal_embedding = torch.zeros(512)
+        if lookup_key not in self._embeddings_registry:
+            raise KeyError(
+                f"Goal embedding key '{lookup_key}' not found in embeddings registry. "
+                f"Check that cfg.env.split ('{self._split}') matches the actual split "
+                f"folder name, and that goal_image_path in the episode data is correct."
+            )
 
+        self._cached_goal_embedding = self._embeddings_registry[lookup_key]
         return self._cached_goal_embedding
 
     def _get_cached_goal(self) -> torch.Tensor:

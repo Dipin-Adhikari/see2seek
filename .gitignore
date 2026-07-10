@@ -6,3 +6,7 @@ imgs/
 test.ipynb
 imagenav_dataset/
 test.py
+birds_eye_views
+data
+tests
+wandb

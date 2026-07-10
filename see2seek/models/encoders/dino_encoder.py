@@ -54,7 +54,8 @@ class DINOv2Encoder(nn.Module):
         embed_dim (int): Output embedding dimension = 512.
     """
 
-    embed_dim: int = 512
+    embed_dim: int = 768
+
 
     def __init__(
         self,
@@ -80,6 +81,8 @@ class DINOv2Encoder(nn.Module):
 
         # Move to target device
         self._backbone.to(self.device)
+
+
 
         # Pre-build normalisation transform (applied inside forward)
         if normalize:
@@ -138,7 +141,7 @@ class DINOv2Encoder(nn.Module):
 
         # DINOv2 forward_features returns a dict; 'x_norm_clstoken' is CLS
         features = self._backbone.forward_features(rgb)
-        cls_token: torch.Tensor = features["x_norm_clstoken"]  # (B, 512)
+        cls_token: torch.Tensor = features["x_norm_clstoken"]  # (B, 768)
 
         return cls_token
     
