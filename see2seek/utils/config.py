@@ -9,7 +9,7 @@ Architecture note (matches ZSON embedding layout):
     obs_embed_dim   = 512   (DINOv2 ViT-B/14 CLS token)
     goal_embed_dim  = 512   (CLIP   ViT-B/32  CLS token)
     action_embed_dim= 32    (learned embedding of previous discrete action)
-    policy_input_dim= 1056  (concatenation of the three above)
+    policy_input_dim= 1312  (concatenation of the three above)
 """
 
 from dataclasses import dataclass, field
@@ -26,7 +26,7 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "debug"                    # "train" | "val" | "test"
+    split: str = "train"                    # "train" | "val" | "test"
     scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug"
     episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug/episodes"
 
@@ -49,12 +49,14 @@ class EnvConfig:
     slack_reward: float = -0.01            # small penalty per step
     geodesic_reward_scale: float = 1.0    # scale on geodesic-distance delta
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
+    collision_penalty: float = -0.03
+
 
     # --- Episode limits ---
     max_steps: int = 500
 
     # --- Parallelism ---
-    num_envs: int = 1                     # number of parallel rollout workers
+    num_envs: int = 6                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +84,6 @@ class EncoderConfig:
 
     # --- Combined policy input ---
     # policy_input_dim = obs_embed_dim + goal_embed_dim + action_embed_dim
-    # = 512 + 512 + 32 = 1056
     @property
     def policy_input_dim(self) -> int:
         return self.obs_embed_dim + self.goal_embed_dim + self.action_embed_dim
@@ -132,8 +133,8 @@ class PPOConfig:
     entropy_coef: float = 0.01            # entropy bonus coefficient
 
     # --- Training length ---
-    total_num_steps: int = 750     # total env steps (≈ ZSON scale-down)
-    checkpoint_interval: int = 500_000    # save every N env steps
+    total_num_steps: int = 1000000     # total env steps 
+    checkpoint_interval: int = 50000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
 
 

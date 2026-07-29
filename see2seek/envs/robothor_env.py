@@ -112,6 +112,7 @@ class RoboTHOREnv:
         self._cached_goal_embedding: Optional[torch.Tensor] = None
         self._prev_geodesic_dist: float = 0.0
         self._num_steps: int = 0
+        self._episode_collisions: int = 0  # FIX #2: initialize here (was previously undefined)
 
         # Lazy-initialise AI2-THOR backend controller
         self._controller = None
@@ -136,7 +137,7 @@ class RoboTHOREnv:
         self._controller = Controller(
             agentMode="locobot",  # must be "locobot" for RoboTHOR scenes
             visibilityDistance=1.5,
-            scene="FloorPlan_Train1_1",
+            #scene="FloorPlan_Train1_1",
             gridSize=self.cfg.env.move_magnitude,
             rotateStepDegrees=self.cfg.env.rotate_degrees,
             snapToGrid=False,
@@ -234,6 +235,7 @@ class RoboTHOREnv:
         self._current_episode = self._episodes[self._episode_index]
         self._episode_index += 1
         self._num_steps = 0
+        self._episode_collisions = 0  # FIX #2: reset the per-episode collision counter
 
         ep = self._current_episode
         scene = ep["scene"]
@@ -316,15 +318,18 @@ class RoboTHOREnv:
                 f"{event.metadata.get('errorMessage')}"
             )
 
-        # Track trajectory progress rewards toward destination coordinate targets
         goal_pos = self._current_episode["shortest_path"][-1]
         curr_dist = self._get_geodesic_distance(goal_pos)
 
         reward = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
         reward += self.cfg.env.slack_reward
+
+        if action_name in {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"} and event.metadata.get("collided", False):
+            reward += self.cfg.env.collision_penalty
+            self._episode_collisions += 1
+
         self._prev_geodesic_dist = curr_dist
 
-        # Max step timeout verification checks
         done = self._num_steps >= self.cfg.env.max_steps
         info = self._build_info(success=False, done=done)
 
@@ -417,6 +422,7 @@ class RoboTHOREnv:
             "num_steps": self._num_steps,
             "episode_id": self._current_episode.get("id", "?"),
             "scene_id": self._current_episode.get("scene", "?"),
+            "collisions": self._episode_collisions,
         }
 
     # =======================================================================
