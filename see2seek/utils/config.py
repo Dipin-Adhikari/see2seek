@@ -137,7 +137,7 @@ class PPOConfig:
 
     # --- Training length ---
     total_num_steps: int = 1000000     # total env steps 
-    checkpoint_interval: int = 10000    # save every N env steps
+    checkpoint_interval: int = 50000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
 
 

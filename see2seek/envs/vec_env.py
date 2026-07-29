@@ -23,6 +23,24 @@ Resilience note (added):
     result back through the pipe before exiting, so the parent can raise
     a clear, actionable error instead of an opaque EOFError.
 
+Resilience note (fd leak fix — added):
+    conn.send() on a dict containing raw CPU torch.Tensors does NOT pickle
+    them by value. torch installs a custom multiprocessing reducer that
+    shares CPU tensors via shared memory, which (under Linux's default
+    "file_descriptor" sharing strategy) opens a new file descriptor for
+    every tensor sent through the pipe. Sending an "rgb" + "goal" tensor
+    every single step, from every worker, steadily accumulates fds that
+    are not reclaimed as fast as they're opened — long runs eventually
+    exceed the process ulimit (`OSError: [Errno 24] Too many open files`),
+    which previously killed a worker mid-training (see step ~23k crash).
+
+    Fix: obs dicts are converted to plain numpy arrays (`.numpy()`) right
+    before every conn.send() in the worker, and converted back to a single
+    batched torch tensor per key in `_stack_obs` on the parent side.
+    Numpy arrays are pickled by value over the pipe — no shared memory,
+    no fd involved. This trades a small per-step serialization copy for
+    eliminating the leak entirely; it does not require raising ulimit -n.
+
 Usage:
     vec_env = make_vec_envs(cfg)
     obs = vec_env.reset_all()          # list of obs dicts → batched tensors
@@ -36,11 +54,37 @@ import logging
 import multiprocessing as mp
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from .robothor_env import RoboTHOREnv
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for tensor <-> numpy conversion across the pipe boundary
+# ---------------------------------------------------------------------------
+
+def _obs_to_numpy(obs: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+    """
+    Convert an obs dict's torch.Tensor values to numpy arrays before sending
+    through a multiprocessing pipe.
+
+    This is the core of the fd-leak fix: numpy arrays are pickled by value,
+    while raw CPU torch.Tensors are shared via shared memory (one fd per
+    tensor, per send) by torch's custom multiprocessing reducer.
+
+    Detaches + moves to CPU first in case a tensor ever ends up on GPU or
+    requires grad (defensive — obs tensors here are always CPU/no-grad in
+    practice, but this keeps the conversion safe regardless).
+    """
+    return {k: v.detach().cpu().numpy() for k, v in obs.items()}
+
+
+def _obs_to_tensor(obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    """Inverse of _obs_to_numpy — used on the parent side after recv."""
+    return {k: torch.from_numpy(v) for k, v in obs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +104,8 @@ def _worker(
     and sending back results through the pipe.
 
     Commands (sent as tuples):
-        ("reset",)           → obs dict
-        ("step", action)     → (obs dict, reward, done, info)
+        ("reset",)           → obs dict (numpy arrays)
+        ("step", action)     → (obs dict (numpy arrays), reward, done, info)
         ("close",)           → exits loop
 
     On any unexpected exception while handling a command, the worker
@@ -84,7 +128,7 @@ def _worker(
         try:
             if cmd == "reset":
                 obs = env.reset()
-                conn.send(obs)
+                conn.send(_obs_to_numpy(obs))
 
             elif cmd == "step":
                 action = args[0]
@@ -93,7 +137,7 @@ def _worker(
                     # Seamless auto-reset: returned 'obs' is the initial frame of the next
                     # episode, while reward/done/info correspond to the terminal transition.
                     obs = env.reset()
-                conn.send((obs, reward, done, info))
+                conn.send((_obs_to_numpy(obs), reward, done, info))
 
             elif cmd == "close":
                 env.close()
@@ -250,16 +294,26 @@ class VecEnv:
         return results
 
     @staticmethod
-    def _stack_obs(obs_list: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _stack_obs(obs_list: List[Dict[str, np.ndarray]]) -> Dict[str, torch.Tensor]:
         """
-        Stack a list of per-env obs dicts into batched tensors.
+        Stack a list of per-env obs dicts (numpy arrays, as received over
+        the pipe — see the fd-leak fix note at the top of this file) into
+        batched torch tensors.
 
         Handles non-uniform shapes per key gracefully:
             - "rgb" items of shape (3, H, W) -> stacked to (N, 3, H, W)
             - "goal" items of shape (512,)   -> stacked to (N, 512)
+
+        Uses np.stack + a single torch.from_numpy per key (one conversion
+        for the whole batch) rather than converting each env's arrays to a
+        tensor individually — cheaper and keeps the "convert once, at the
+        batch boundary" invariant that avoids the original fd leak.
         """
         keys = obs_list[0].keys()
-        return {k: torch.stack([obs[k] for obs in obs_list], dim=0) for k in keys}
+        return {
+            k: torch.from_numpy(np.stack([obs[k] for obs in obs_list], axis=0))
+            for k in keys
+        }
 
 
 # ---------------------------------------------------------------------------
