@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import deque
 # from turtle import done
 from typing import Optional
 
@@ -103,6 +104,12 @@ class PPOTrainer:
         self._total_steps = 0
         self._num_updates = 0
         self._start_time  = time.time()
+
+        # ---- Episode-level metric tracking (rolling window over last 100 episodes) ----
+        self._recent_rewards   = deque(maxlen=100)
+        self._recent_successes = deque(maxlen=100)
+        self._recent_spls      = deque(maxlen=100)
+        self._running_reward   = torch.zeros(cfg.env.num_envs, device=self.device)
 
         # Resume from checkpoint if provided
         if resume is not None:
@@ -191,6 +198,18 @@ class PPOTrainer:
                 # 1d. Step environments
                 obs_dict, rewards, dones, infos = self.vec_env.step(actions)
                 rewards = rewards.to(self.device)
+
+                # --- episode-level bookkeeping ---
+                self._running_reward += rewards
+                for env_idx in range(cfg.env.num_envs):
+                    if dones[env_idx]:
+                        self._recent_rewards.append(self._running_reward[env_idx].item())
+                        info = infos[env_idx]
+                        if "success" in info:
+                            self._recent_successes.append(float(info["success"]))
+                        if "spl" in info:
+                            self._recent_spls.append(info["spl"])
+                        self._running_reward[env_idx] = 0.0
 
                 # 1e. Build masks for NEXT step (0 if this step was terminal)
                 new_masks = (~dones).float().unsqueeze(1).to(self.device)  # (N, 1)
@@ -363,11 +382,18 @@ class PPOTrainer:
         steps_ps   = self._total_steps / max(elapsed, 1)
         fps        = (self.cfg.ppo.num_steps * self.cfg.env.num_envs) / (time.time() - collect_start)
 
+        mean_reward  = sum(self._recent_rewards)   / len(self._recent_rewards)   if self._recent_rewards   else 0.0
+        success_rate = sum(self._recent_successes) / len(self._recent_successes) if self._recent_successes else 0.0
+        mean_spl     = sum(self._recent_spls)      / len(self._recent_spls)      if self._recent_spls      else 0.0
+
         logger.info(
             f"[{self._total_steps:>10,} steps | update {self._num_updates:>5}] "
             f"policy_loss={metrics['policy_loss']:.4f}  "
             f"value_loss={metrics['value_loss']:.4f}  "
             f"entropy={metrics['entropy']:.4f}  "
+            f"reward={mean_reward:.3f}  "
+            f"SR={success_rate:.3f}  "
+            f"SPL={mean_spl:.3f}  "
             f"fps={fps:.0f}"
         )
 
@@ -379,4 +405,7 @@ class PPOTrainer:
                 "train/total_loss":  metrics["total_loss"],
                 "train/fps":         fps,
                 "train/total_steps": self._total_steps,
+                "train/mean_episode_reward": mean_reward,
+                "train/success_rate": success_rate,
+                "train/spl": mean_spl,
             })

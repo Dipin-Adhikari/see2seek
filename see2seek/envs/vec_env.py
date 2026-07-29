@@ -13,6 +13,16 @@ Key design choices:
       used by the trainer to seamlessly continue rollouts across episodes.
     - Observations are stacked into batched tensors for GPU efficiency.
 
+Resilience note (added):
+    Previously, any uncaught exception inside a worker process (e.g. a
+    RoboTHOREnv.reset()/step() failure) would kill that subprocess
+    silently. The parent process's blocking conn.recv() would then raise
+    a bare EOFError with no indication of what actually went wrong. The
+    worker loop now wraps each command in a try/except: on failure it
+    logs the exception locally *and* sends a tagged ("__error__", message)
+    result back through the pipe before exiting, so the parent can raise
+    a clear, actionable error instead of an opaque EOFError.
+
 Usage:
     vec_env = make_vec_envs(cfg)
     obs = vec_env.reset_all()          # list of obs dicts → batched tensors
@@ -53,6 +63,12 @@ def _worker(
         ("reset",)           → obs dict
         ("step", action)     → (obs dict, reward, done, info)
         ("close",)           → exits loop
+
+    On any unexpected exception while handling a command, the worker
+    logs the full traceback locally, sends back a tagged
+    ("__error__", worker_id, message) tuple so the parent process can
+    surface a meaningful error, and then exits the loop (the subprocess
+    terminates after this function returns).
     """
     parent_conn.close()   # child does not use parent side of pipe
 
@@ -65,25 +81,45 @@ def _worker(
         except EOFError:
             break
 
-        if cmd == "reset":
-            obs = env.reset()
-            conn.send(obs)
+        try:
+            if cmd == "reset":
+                obs = env.reset()
+                conn.send(obs)
 
-        elif cmd == "step":
-            action = args[0]
-            obs, reward, done, info = env.step(action)
-            if done:
-                # Seamless auto-reset: returned 'obs' is the initial frame of the next 
-                # episode, while reward/done/info correspond to the terminal transition.
-                obs = env.reset()   
-            conn.send((obs, reward, done, info))
+            elif cmd == "step":
+                action = args[0]
+                obs, reward, done, info = env.step(action)
+                if done:
+                    # Seamless auto-reset: returned 'obs' is the initial frame of the next
+                    # episode, while reward/done/info correspond to the terminal transition.
+                    obs = env.reset()
+                conn.send((obs, reward, done, info))
 
-        elif cmd == "close":
-            env.close()
+            elif cmd == "close":
+                env.close()
+                break
+
+            else:
+                raise ValueError(f"Unknown command: {cmd}")
+
+        except Exception as e:
+            # Log full traceback in this worker's own logs for debugging,
+            # then report a tagged error back through the pipe instead of
+            # letting the subprocess die silently (which would otherwise
+            # surface as a bare EOFError in the parent process).
+            logger.exception(
+                f"Worker {worker_id} raised an exception handling cmd={cmd!r}"
+            )
+            try:
+                conn.send(("__error__", worker_id, f"{type(e).__name__}: {e}"))
+            except (BrokenPipeError, EOFError):
+                pass
             break
 
-        else:
-            raise ValueError(f"Unknown command: {cmd}")
+    try:
+        env.close()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +174,7 @@ class VecEnv:
         for conn in self._parent_conns:
             conn.send(("reset",))
 
-        obs_list = [conn.recv() for conn in self._parent_conns]
+        obs_list = self._recv_all()
         return self._stack_obs(obs_list)
 
     def step(
@@ -161,7 +197,7 @@ class VecEnv:
             conn.send(("step", action))
 
         # Collect results
-        results = [conn.recv() for conn in self._parent_conns]
+        results = self._recv_all()
         obs_list   = [r[0] for r in results]
         rewards    = torch.tensor([r[1] for r in results], dtype=torch.float32)
         dones      = torch.tensor([r[2] for r in results], dtype=torch.bool)
@@ -186,11 +222,38 @@ class VecEnv:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _recv_all(self) -> List[Any]:
+        """
+        Receive one result from every parent connection, raising a clear
+        RuntimeError if any worker reported an error or died unexpectedly
+        (pipe closed -> EOFError) instead of letting a bare EOFError
+        propagate up from multiprocessing internals.
+        """
+        results = []
+        for i, conn in enumerate(self._parent_conns):
+            try:
+                result = conn.recv()
+            except EOFError as e:
+                raise RuntimeError(
+                    f"VecEnv: worker {i} pipe closed unexpectedly (process likely "
+                    f"crashed). Check the worker's own stderr/log output above for "
+                    f"the original traceback."
+                ) from e
+
+            if isinstance(result, tuple) and len(result) == 3 and result[0] == "__error__":
+                _, worker_id, message = result
+                raise RuntimeError(
+                    f"VecEnv: worker {worker_id} reported an error: {message}"
+                )
+
+            results.append(result)
+        return results
+
     @staticmethod
     def _stack_obs(obs_list: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """
         Stack a list of per-env obs dicts into batched tensors.
-        
+
         Handles non-uniform shapes per key gracefully:
             - "rgb" items of shape (3, H, W) -> stacked to (N, 3, H, W)
             - "goal" items of shape (512,)   -> stacked to (N, 512)

@@ -24,6 +24,35 @@ Usage:
     obs_dict = env.reset()
     obs_dict, reward, done, info = env.step(action_int)
     env.close()
+
+Resilience note (bad-spawn episodes):
+    A small fraction of pre-generated RoboTHOR episodes have starting
+    poses (position/rotation) that collide with static objects in the
+    scene (e.g. a BaseballBat, a wall panel, etc.). AI2-THOR's
+    TeleportFull will refuse these placements and return
+    lastActionSuccess=False. reset() retries with the next episode (up
+    to `_max_reset_retries` times) instead of crashing, and only raises
+    once retries are exhausted — which would indicate a systemic
+    problem, not a single bad episode.
+
+Resilience note (Unity/controller crash mid-episode — added):
+    The AI2-THOR "controller" is really a thin RPC client talking to a
+    separate Unity subprocess over a FIFO pipe. If that Unity process
+    dies (commonly from GPU/VRAM pressure on smaller cards, but also
+    just occasional engine instability over long runs), the *next*
+    write to the pipe raises a low-level BrokenPipeError/OSError deep
+    inside ai2thor's fifo_server — not a clean AI2-THOR exception.
+    Previously this propagated all the way up through step(), through
+    the worker process, and killed the whole training run.
+
+    step() now wraps the underlying controller calls and, on detecting
+    a dead pipe/controller, tears down and restarts the Controller
+    (_restart_controller) and starts a fresh episode via reset(),
+    rather than letting the exception kill the worker. The returned
+    transition is marked done=True with reward 0.0 and
+    info["controller_crashed"]=True so the trainer's rollout/GAE logic
+    treats it as a normal episode boundary (bootstrapping is not
+    affected by a mid-episode crash-restart).
 """
 
 from __future__ import annotations
@@ -52,6 +81,17 @@ ACTIONS = {
     3: "Stop",
 }
 
+# Exceptions that indicate the Unity subprocess / IPC pipe backing the
+# AI2-THOR controller has died, rather than a normal in-sim action failure
+# (those are reported via event.metadata["lastActionSuccess"], not raised).
+_CONTROLLER_DEAD_EXCEPTIONS = (BrokenPipeError, ConnectionError, EOFError, OSError)
+
+
+class ControllerCrashError(RuntimeError):
+    """Raised internally when the AI2-THOR/Unity backend has died and could
+    not be recovered within a single episode's controller restart."""
+
+
 # ===========================================================================
 # Environment
 # ===========================================================================
@@ -65,6 +105,19 @@ class RoboTHOREnv:
         worker_id:  Integer offset for AI2-THOR server port management.
         render:     If True, render frames to screen (slow, for debugging).
     """
+
+    # Max number of consecutive bad episodes we'll skip past in reset()
+    # before giving up and raising. A handful of collision-spawn episodes
+    # in a row is expected occasionally; hundreds in a row means something
+    # else is wrong (bad dataset path, corrupted episode file, etc).
+    _max_reset_retries: int = 20
+
+    # Max number of times we'll restart a dead Unity controller within a
+    # single step() call before giving up and raising ControllerCrashError.
+    # Restarting Unity is expensive (~seconds), so this is intentionally
+    # small — repeated failures back-to-back mean something systemic
+    # (e.g. GPU OOM that a fresh process will hit again immediately).
+    _max_controller_restarts: int = 3
 
     def __init__(
         self,
@@ -112,7 +165,7 @@ class RoboTHOREnv:
         self._cached_goal_embedding: Optional[torch.Tensor] = None
         self._prev_geodesic_dist: float = 0.0
         self._num_steps: int = 0
-        self._episode_collisions: int = 0  # FIX #2: initialize here (was previously undefined)
+        self._episode_collisions: int = 0
 
         # Lazy-initialise AI2-THOR backend controller
         self._controller = None
@@ -151,6 +204,32 @@ class RoboTHOREnv:
             # gpu_device=0,
             # platform=platform_setting,
         )
+
+    def _restart_controller(self) -> None:
+        """
+        Tear down a dead/unresponsive AI2-THOR controller and start a fresh
+        one on the same port.
+
+        Called when a controller RPC raises one of
+        `_CONTROLLER_DEAD_EXCEPTIONS`, indicating the backing Unity
+        subprocess has crashed and the FIFO pipe to it is broken. Any
+        exception from `.stop()` on the old (already-dead) controller is
+        swallowed — there is nothing meaningful left to clean up on that
+        side, and we don't want a failed shutdown to mask the restart.
+        """
+        logger.warning(
+            f"RoboTHOREnv[{self._worker_id}] AI2-THOR controller appears to have "
+            f"crashed — restarting Unity backend on port {8200 + self._worker_id} ..."
+        )
+        if self._controller is not None:
+            try:
+                self._controller.stop()
+            except Exception:
+                pass
+            self._controller = None
+
+        self._init_controller()
+        logger.info(f"RoboTHOREnv[{self._worker_id}] controller restarted successfully.")
 
     def _load_episodes(
         self,
@@ -223,93 +302,153 @@ class RoboTHOREnv:
         """
         Reset to a new dataset scenario trajectory.
 
+        Resilient to "bad" episodes whose starting pose collides with a
+        static object in the scene (TeleportFull -> lastActionSuccess=False)
+        or whose renderer fails to produce a frame. Such episodes are
+        skipped in favor of the next one in the shuffled queue, up to
+        `_max_reset_retries` consecutive attempts, instead of raising and
+        killing the worker subprocess.
+
+        Also resilient to the controller itself being dead (e.g. called
+        right after a mid-episode Unity crash during step()): a
+        BrokenPipeError/OSError here triggers a controller restart and a
+        retry of the same reset attempt, without consuming one of the
+        "bad episode" retries.
+
         Returns:
             obs: dict tracking keys:
                 "rgb":  (3, H, W) live camera float view tensor
                 "goal": (512,) precalculated float embedding target vector
         """
-        if self._episode_index >= len(self._episodes):
-            random.shuffle(self._episodes)
-            self._episode_index = 0
+        last_error: Optional[str] = None
+        controller_restarts = 0
 
-        self._current_episode = self._episodes[self._episode_index]
-        self._episode_index += 1
-        self._num_steps = 0
-        self._episode_collisions = 0  # FIX #2: reset the per-episode collision counter
+        attempt = 0
+        while attempt < self._max_reset_retries:
+            if self._episode_index >= len(self._episodes):
+                random.shuffle(self._episodes)
+                self._episode_index = 0
 
-        ep = self._current_episode
-        scene = ep["scene"]
+            self._current_episode = self._episodes[self._episode_index]
+            self._episode_index += 1
+            self._num_steps = 0
+            self._episode_collisions = 0
 
-        # 1. Reset simulator framework window state target
-        event = self._controller.reset(scene=scene)
+            ep = self._current_episode
+            scene = ep["scene"]
 
-        # CloudRendering can return a None frame on the very first event while
-        # the render server is still warming up (common on weaker/laptop GPUs).
-        # Force a few no-op steps until a real frame comes back.
-        retries = 0
-        max_retries = 5
-        while event.frame is None and retries < max_retries:
-            event = self._controller.step(action="Pass")
-            retries += 1
+            try:
+                # 1. Reset simulator framework window state target
+                event = self._controller.reset(scene=scene)
 
-        if event.frame is None:
-            raise RuntimeError(
-                f"Renderer failed to produce a frame after {retries} retries "
-                f"(scene={scene}). Check CloudRendering / GPU setup."
-            )
+                # CloudRendering can return a None frame on the very first event while
+                # the render server is still warming up (common on weaker/laptop GPUs).
+                # Force a few no-op steps until a real frame comes back.
+                retries = 0
+                max_retries = 5
+                while event.frame is None and retries < max_retries:
+                    event = self._controller.step(action="Pass")
+                    retries += 1
 
-        # 2. Build rotation payload matching AI2-THOR API parameters (Yaw mapping)
-        start_rotation = {"x": 0, "y": ep.get("initial_orientation", 0.0), "z": 0}
+                if event.frame is None:
+                    last_error = f"Renderer failed to produce a frame after {retries} retries (scene={scene})"
+                    logger.warning(f"{last_error} — skipping to next episode")
+                    attempt += 1
+                    continue
 
-        event = self._controller.step(
-            action="TeleportFull",
-            position=ep["initial_position"],
-            rotation=start_rotation,
-            horizon=ep.get("initial_horizon", 0),
+                # 2. Build rotation payload matching AI2-THOR API parameters (Yaw mapping)
+                start_rotation = {"x": 0, "y": ep.get("initial_orientation", 0.0), "z": 0}
+
+                event = self._controller.step(
+                    action="TeleportFull",
+                    position=ep["initial_position"],
+                    rotation=start_rotation,
+                    horizon=ep.get("initial_horizon", 0),
+                )
+            except _CONTROLLER_DEAD_EXCEPTIONS as e:
+                # Unity died during reset itself. Restart the controller and
+                # retry this same episode attempt (don't burn a "bad episode"
+                # retry on what is really a backend crash).
+                controller_restarts += 1
+                if controller_restarts > self._max_controller_restarts:
+                    raise ControllerCrashError(
+                        f"RoboTHOREnv[{self._worker_id}] controller crashed "
+                        f"{controller_restarts} times during reset(); giving up. "
+                        f"Last error: {type(e).__name__}: {e}"
+                    ) from e
+                self._restart_controller()
+                self._episode_index -= 1  # re-try the same episode, don't skip it
+                continue
+
+            if not event.metadata.get("lastActionSuccess", True):
+                last_error = (
+                    f"TeleportFull failed for episode={ep.get('id', '?')} scene={scene}, "
+                    f"position={ep['initial_position']}, rotation={start_rotation}: "
+                    f"{event.metadata.get('errorMessage')}"
+                )
+                logger.warning(f"{last_error} — skipping to next episode")
+                attempt += 1
+                continue
+
+            if event.frame is None:
+                last_error = f"TeleportFull succeeded but returned no frame (scene={scene})"
+                logger.warning(f"{last_error} — skipping to next episode")
+                attempt += 1
+                continue
+
+            # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
+            goal_pos = ep["shortest_path"][-1]
+            self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
+
+            # 4. Fetch the environment state observations
+            rgb = self._get_rgb_tensor(event.frame)
+            goal_embedding = self._load_goal_embedding(ep)
+
+            return {"rgb": rgb, "goal": goal_embedding}
+
+        # Exhausted all retries — this indicates a systemic problem
+        # (e.g. bad dataset path, corrupted episode file) rather than a
+        # single unlucky spawn, so we raise here.
+        raise RuntimeError(
+            f"RoboTHOREnv[{self._worker_id}] failed to reset after "
+            f"{self._max_reset_retries} consecutive attempts. "
+            f"Last error: {last_error}"
         )
-
-        if not event.metadata.get("lastActionSuccess", True):
-            raise RuntimeError(
-                f"TeleportFull failed for scene={scene}, "
-                f"position={ep['initial_position']}, rotation={start_rotation}: "
-                f"{event.metadata.get('errorMessage')}"
-            )
-
-        if event.frame is None:
-            raise RuntimeError(
-                f"TeleportFull succeeded but returned no frame (scene={scene})"
-            )
-
-        # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
-        goal_pos = ep["shortest_path"][-1]
-        self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
-
-        # 4. Fetch the environment state observations
-        rgb = self._get_rgb_tensor(event.frame)
-        goal_embedding = self._load_goal_embedding(ep)
-
-        return {"rgb": rgb, "goal": goal_embedding}
 
     def step(
         self, action: int
     ) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
-        """Executes a control navigation step command."""
+        """
+        Executes a control navigation step command.
+
+        If the AI2-THOR/Unity backend has crashed (pipe broken), the
+        controller is restarted and a fresh episode is started via
+        reset(). The transition returned in that case is a synthetic
+        episode boundary: reward=0.0, done=True,
+        info["controller_crashed"]=True — the trainer's rollout buffer
+        should treat it exactly like any other episode-terminal step
+        (value bootstrapping for a done=True step is already a no-op in
+        standard PPO/GAE implementations).
+        """
         assert 0 <= action < len(ACTIONS), f"Action index bounds error: {action}"
 
         self._num_steps += 1
         action_name = ACTIONS[action]
 
-        if action_name == "Stop":
-            done, success = self._handle_stop()
-            reward = self.cfg.env.success_reward if success else 0.0
-            info = self._build_info(success, done)
-            obs = {
-                "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
-                "goal": self._get_cached_goal(),
-            }
-            return obs, reward, done, info
+        try:
+            if action_name == "Stop":
+                done, success = self._handle_stop()
+                reward = self.cfg.env.success_reward if success else 0.0
+                info = self._build_info(success, done)
+                obs = {
+                    "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
+                    "goal": self._get_cached_goal(),
+                }
+                return obs, reward, done, info
 
-        event = self._controller.step(action=action_name)
+            event = self._controller.step(action=action_name)
+        except _CONTROLLER_DEAD_EXCEPTIONS as e:
+            return self._recover_from_controller_crash(action_name, e)
 
         if not event.metadata.get("lastActionSuccess", True):
             logger.warning(
@@ -335,6 +474,58 @@ class RoboTHOREnv:
 
         obs = {"rgb": self._get_rgb_tensor(event.frame), "goal": self._get_cached_goal()}
         return obs, reward, done, info
+
+    def _recover_from_controller_crash(
+        self, action_name: str, exc: Exception
+    ) -> Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, Any]]:
+        """
+        Handle a dead-controller exception raised mid-step: restart Unity,
+        start a fresh episode, and return a synthetic terminal transition
+        so the caller (VecEnv worker / trainer) sees a clean episode
+        boundary rather than a propagating exception.
+
+        Raises ControllerCrashError if the controller cannot be brought
+        back up within `_max_controller_restarts` attempts — at that
+        point something systemic (e.g. persistent GPU OOM) is going on
+        and it's better to fail loudly than restart-loop forever.
+        """
+        episode_id = self._current_episode.get("id", "?") if self._current_episode else "?"
+        logger.error(
+            f"RoboTHOREnv[{self._worker_id}] controller/backend crashed while executing "
+            f"'{action_name}' at step {self._num_steps} (episode={episode_id}): "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        restarts = 0
+        while restarts < self._max_controller_restarts:
+            restarts += 1
+            try:
+                self._restart_controller()
+                obs = self.reset()
+                info = {
+                    "success": False,
+                    "done": True,
+                    "num_steps": self._num_steps,
+                    "episode_id": episode_id,
+                    "scene_id": self._current_episode.get("scene", "?") if self._current_episode else "?",
+                    "collisions": self._episode_collisions,
+                    "controller_crashed": True,
+                }
+                return obs, 0.0, True, info
+            except _CONTROLLER_DEAD_EXCEPTIONS as e:
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] controller restart attempt "
+                    f"{restarts}/{self._max_controller_restarts} failed: {type(e).__name__}: {e}"
+                )
+                exc = e
+
+        raise ControllerCrashError(
+            f"RoboTHOREnv[{self._worker_id}] could not recover controller after "
+            f"{self._max_controller_restarts} restart attempts. Last error: "
+            f"{type(exc).__name__}: {exc}. This usually means something systemic "
+            f"(e.g. persistent GPU OOM) rather than a one-off crash — check "
+            f"`nvidia-smi` / `dmesg` for OOM-killer activity."
+        ) from exc
 
     def close(self) -> None:
         if self._controller is not None:

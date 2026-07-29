@@ -27,8 +27,11 @@ class EnvConfig:
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
     split: str = "train"                    # "train" | "val" | "test"
-    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug"
-    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/debug/episodes"
+    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
+    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
+
+    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -134,7 +137,7 @@ class PPOConfig:
 
     # --- Training length ---
     total_num_steps: int = 1000000     # total env steps 
-    checkpoint_interval: int = 50000    # save every N env steps
+    checkpoint_interval: int = 10000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
 
 
