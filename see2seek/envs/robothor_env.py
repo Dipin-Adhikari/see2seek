@@ -400,6 +400,14 @@ class RoboTHOREnv:
             goal_pos = ep["shortest_path"][-1]
             self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
 
+            # 3b. SPL bookkeeping: L = shortest-path length (sum of segment
+            # lengths along the precomputed shortest_path waypoints), and
+            # P = distance actually traveled this episode (accumulated in
+            # step(), reset here to 0).
+            self._shortest_path_length = self._compute_path_length(ep["shortest_path"])
+            self._path_length = 0.0
+            self._last_agent_pos = dict(ep["initial_position"])
+
             # 4. Fetch the environment state observations
             rgb = self._get_rgb_tensor(event.frame)
             goal_embedding = self._load_goal_embedding(ep)
@@ -449,6 +457,15 @@ class RoboTHOREnv:
             event = self._controller.step(action=action_name)
         except _CONTROLLER_DEAD_EXCEPTIONS as e:
             return self._recover_from_controller_crash(action_name, e)
+
+        # Accumulate traveled path length (only counts actual displacement,
+        # so failed/blocked moves that don't change position contribute ~0).
+        agent_pos = event.metadata["agent"]["position"]
+        self._path_length += float(np.linalg.norm([
+            agent_pos["x"] - self._last_agent_pos["x"],
+            agent_pos["z"] - self._last_agent_pos["z"],
+        ]))
+        self._last_agent_pos = dict(agent_pos)
 
         if not event.metadata.get("lastActionSuccess", True):
             logger.warning(
@@ -556,6 +573,15 @@ class RoboTHOREnv:
         ])
         return float(dist)
 
+    def _compute_path_length(self, waypoints: List[Dict]) -> float:
+        """Sum consecutive XZ-plane distances along the shortest_path waypoint list."""
+        if len(waypoints) < 2:
+            return 0.0
+        total = 0.0
+        for a, b in zip(waypoints[:-1], waypoints[1:]):
+            total += float(np.linalg.norm([a["x"] - b["x"], a["z"] - b["z"]]))
+        return total
+
     def _get_rgb_tensor(self, frame: Optional[np.ndarray] = None) -> torch.Tensor:
         """
         Convert a raw AI2-THOR RGB frame (HxWx3 uint8 array) into a
@@ -607,9 +633,14 @@ class RoboTHOREnv:
         return self._cached_goal_embedding
 
     def _build_info(self, success: bool, done: bool) -> Dict[str, Any]:
+        spl = 0.0
+        if success and self._shortest_path_length > 0:
+            spl = self._shortest_path_length / max(self._path_length, self._shortest_path_length)
+
         return {
             "success": success,
             "done": done,
+            "spl": spl,
             "num_steps": self._num_steps,
             "episode_id": self._current_episode.get("id", "?"),
             "scene_id": self._current_episode.get("scene", "?"),
