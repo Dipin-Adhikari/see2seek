@@ -18,6 +18,7 @@ Usage:
 import argparse
 import logging
 import os
+from datetime import datetime
 import random
 
 import numpy as np
@@ -36,13 +37,20 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def setup_logging(debug: bool = False) -> None:
+def setup_logging(debug: bool = False, log_dir: str = "data/logs") -> None:
     level = logging.DEBUG if debug else logging.INFO
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file),
+        ],
     )
+    logging.getLogger(__name__).info(f"Logging to {log_file}")
 
 
 def set_seed(seed: int) -> None:
