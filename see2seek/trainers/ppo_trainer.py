@@ -365,12 +365,14 @@ class PPOTrainer:
     def _load_checkpoint(self, path: str) -> None:
         """Load a previously saved checkpoint."""
         logger.info(f"Resuming from checkpoint: {path}")
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.optimiser.load_state_dict(ckpt["optimiser_state_dict"])
         self._total_steps = ckpt.get("total_steps", 0)
         self._num_updates = ckpt.get("num_updates", 0)
         logger.info(f"Resumed at step {self._total_steps:,}")
+
+        
 
     # ------------------------------------------------------------------
     # Logging
