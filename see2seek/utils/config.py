@@ -26,12 +26,17 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "train"                    # "train" | "val" | "test"
+    # split: str = "train"                    # "train" | "val" | "test"
+    split: str = "val"
+
+    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
