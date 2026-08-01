@@ -26,17 +26,17 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    # split: str = "train"                    # "train" | "val" | "test"
-    split: str = "val"
+    split: str = "train"                    # "train" | "val" | "test"
+    # split: str = "val"
 
-    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -53,7 +53,7 @@ class EnvConfig:
     rotate_degrees: float = 30.0           # degrees per RotateLeft/Right
 
     # --- Reward shaping ---
-    success_reward: float = 10.0
+    success_reward: float = 4
     slack_reward: float = -0.01            # small penalty per step
     geodesic_reward_scale: float = 1.0    # scale on geodesic-distance delta
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
@@ -62,6 +62,7 @@ class EnvConfig:
 
     # --- Episode limits ---
     max_steps: int = 500
+    min_steps_before_stop: int = 5                 # don't allow Stop until this many steps
 
     # --- Parallelism ---
     num_envs: int = 6                    # number of parallel rollout workers
@@ -138,10 +139,10 @@ class PPOConfig:
     # --- PPO clipping ---
     clip_param: float = 0.2
     value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01            # entropy bonus coefficient
+    entropy_coef: float = 0.03            # entropy bonus coefficient
 
     # --- Training length ---
-    total_num_steps: int = 1000000     # total env steps 
+    total_num_steps: int = 1500000     # total env steps 
     checkpoint_interval: int = 50000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
 
