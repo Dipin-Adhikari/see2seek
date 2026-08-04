@@ -59,6 +59,7 @@ class RecurrentBatch(NamedTuple):
     old_log_probs:  torch.Tensor    # (chunk_len * num_chunks,)
     returns:        torch.Tensor    # (chunk_len * num_chunks,)
     advantages:     torch.Tensor    # (chunk_len * num_chunks,)
+    can_stop:      torch.Tensor    # (chunk_len * num_chunks,)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,8 @@ class RolloutBuffer:
         self.actions      = torch.zeros(T, N, dtype=torch.long, device=self.device)
         self.prev_actions = torch.zeros(T, N, dtype=torch.long, device=self.device)
 
+        self.can_stop = torch.ones(T, N, dtype=torch.bool, device=self.device)
+
         # Rewards and masks
         # masks[t] = 0 if step t starts a new episode, else 1
         self.rewards = torch.zeros(T,   N, device=self.device)
@@ -152,6 +155,7 @@ class RolloutBuffer:
         value:        torch.Tensor,
         log_prob:     torch.Tensor,
         hidden:       torch.Tensor,
+        can_stop:     torch.Tensor,
     ) -> None:
         """
         Insert one time-step of data from all environments.
@@ -178,6 +182,7 @@ class RolloutBuffer:
         self.values[t]           = value.view(self.num_envs).detach()
         self.log_probs[t]        = log_prob.detach()
         self.hidden_states[t+1]  = hidden.detach()   # hidden AFTER this step
+        self.can_stop[t]         = can_stop
 
         self._step += 1
 
@@ -301,6 +306,7 @@ class RolloutBuffer:
         # We iterate over chunk positions [0, chunk_len) and stack
         obs_list, goal_list, prev_act_list, mask_list = [], [], [], []
         act_list, lp_list, ret_list, adv_list = [], [], [], []
+        can_stop_list = []
 
         for local_t in range(chunk_len):
             t_idx = (start_steps + local_t).clamp(max=self.num_steps - 1)
@@ -312,7 +318,8 @@ class RolloutBuffer:
             lp_list.append(self.log_probs[t_idx, env_ids])
             ret_list.append(self.returns[t_idx, env_ids])
             adv_list.append(self.advantages[t_idx, env_ids])
-
+            can_stop_list.append(self.can_stop[t_idx, env_ids])
+            
         # Stack along time dimension: (chunk_len, num_chunks, ...) → flatten time
         def _flat(lst):
             return torch.stack(lst, dim=0).reshape(-1, *lst[0].shape[1:])
@@ -337,6 +344,7 @@ class RolloutBuffer:
             old_log_probs = _flat(lp_list),
             returns       = _flat(ret_list),
             advantages    = _flat(adv_list),
+            can_stop      = _flat(can_stop_list),
         )
 
     # ------------------------------------------------------------------

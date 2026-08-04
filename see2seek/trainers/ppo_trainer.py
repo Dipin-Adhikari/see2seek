@@ -174,6 +174,7 @@ class PPOTrainer:
             (cfg.env.num_envs,), cfg.env.num_actions, dtype=torch.long, device=self.device
         )   # num_actions index = "no previous action" padding
 
+        steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)   
         while self._total_steps < cfg.ppo.total_num_steps:
             # ---- Phase 1: Collect rollout ----
             self.policy.eval()    # eval for rollout (no dropout)
@@ -188,9 +189,11 @@ class PPOTrainer:
                     # 1b. Encode goal (CLIP — frozen; cached)
                     goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
 
+                    can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
+
                     # 1c. Policy forward
                     dist, value, hidden_next = self.policy.act(
-                        obs_embed, goal_embed, prev_actions, hidden, masks
+                        obs_embed, goal_embed, prev_actions, hidden, masks, can_stop=can_stop
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
@@ -198,6 +201,11 @@ class PPOTrainer:
                 # 1d. Step environments
                 obs_dict, rewards, dones, infos = self.vec_env.step(actions)
                 rewards = rewards.to(self.device)
+
+                steps_since_reset = steps_since_reset + 1
+                steps_since_reset = torch.where(
+                    dones.to(self.device), torch.zeros_like(steps_since_reset), steps_since_reset
+                )
 
                 # --- episode-level bookkeeping ---
                 self._running_reward += rewards
@@ -225,6 +233,7 @@ class PPOTrainer:
                     value       = value.squeeze(-1),
                     log_prob    = log_probs,
                     hidden      = hidden,
+                    can_stop    = can_stop,
                 )
 
                 # 1g. Update recurrent state
@@ -297,6 +306,7 @@ class PPOTrainer:
                     hidden       = batch.hidden_states,
                     masks        = batch.masks,
                     actions      = batch.actions,
+                    can_stop     = batch.can_stop, 
                 )
 
                 # PPO clipped policy loss

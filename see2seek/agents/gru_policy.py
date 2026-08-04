@@ -226,18 +226,15 @@ class GRUActorCritic(nn.Module):
         prev_actions: torch.Tensor,
         hidden: torch.Tensor,
         masks: torch.Tensor,
+        can_stop: Optional[torch.Tensor] = None,   # ADD: (N,) bool, True = Stop allowed
     ) -> Tuple[Categorical, torch.Tensor, torch.Tensor]:
-        """
-        Sample an action during rollout collection.
-
-        Returns:
-            dist:       Categorical distribution (for sampling + log_prob).
-            value:      (B, 1) critic output.
-            hidden_out: (1, B, hidden_size) updated hidden state.
-        """
         logits, value, hidden_out = self.forward(
             obs_embed, goal_embed, prev_actions, hidden, masks
         )
+        if can_stop is not None:
+            stop_idx = self.num_actions - 1   # Stop is action index 3 (last)
+            logits = logits.clone()
+            logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
         return dist, value, hidden_out
 
@@ -249,21 +246,15 @@ class GRUActorCritic(nn.Module):
         hidden: torch.Tensor,
         masks: torch.Tensor,
         actions: torch.Tensor,
+        can_stop: Optional[torch.Tensor] = None,   # ADD
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Re-evaluate stored actions during PPO update (for log_prob and entropy).
-
-        Args:
-            actions: (B,) long — actions that were actually taken.
-
-        Returns:
-            log_probs:  (B,)   — log π(a | s)
-            value:      (B, 1) — V(s)
-            entropy:    scalar — mean entropy of π(· | s)
-        """
         logits, value, _ = self.forward(
             obs_embed, goal_embed, prev_actions, hidden, masks
         )
+        if can_stop is not None:
+            stop_idx = self.num_actions - 1
+            logits = logits.clone()
+            logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
         entropy   = dist.entropy().mean()
