@@ -242,6 +242,11 @@ class PPOTrainer:
                 masks        = new_masks
                 self._total_steps += cfg.env.num_envs
 
+            # ---- Per-action reward diagnostic (gate to avoid log spam) ----
+            if self._num_updates % cfg.ppo.log_interval == 0:
+                self._log_per_action_rewards()
+
+
             # ---- Phase 2: Compute returns ----
             with torch.no_grad():
                 rgb = obs_dict["rgb"].to(self.device)
@@ -342,6 +347,19 @@ class PPOTrainer:
             metrics[k] /= max(num_batches, 1)
 
         return metrics
+
+    def _log_per_action_rewards(self) -> None:
+        """Log mean reward per action type from the just-collected rollout buffer.
+        Call this AFTER the collection loop, BEFORE buffer.after_update() clears state."""
+        action_names = {0: "MoveAhead", 1: "RotateLeft", 2: "RotateRight", 3: "Stop"}
+        T = self.buffer.num_steps
+        for a_id, a_name in action_names.items():
+            mask = (self.buffer.actions[:T] == a_id)
+            count = mask.sum().item()
+            if count > 0:
+                mean_r = self.buffer.rewards[:T][mask].mean().item()
+                logger.info(f"    action={a_name:12s} count={count:6d} mean_reward={mean_r:+.4f}")
+    
 
     # ------------------------------------------------------------------
     # Goal embedding helper

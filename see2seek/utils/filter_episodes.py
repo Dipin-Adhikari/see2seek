@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Filter short-distance episodes from the See2Seek RoboTHOR training dataset.
 
@@ -13,7 +12,6 @@ Usage:
     python filter_short_episodes.py --dataset_dir /home/dipin/See2Seek/dataset/train
     python filter_short_episodes.py --dataset_dir ... --dry_run   # report only
     python filter_short_episodes.py --dataset_dir ... --threshold 1.0
-
 
 """
 import argparse

@@ -480,9 +480,11 @@ class RoboTHOREnv:
         reward = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
         reward += self.cfg.env.slack_reward
 
-        if action_name in {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"} and event.metadata.get("collided", False):
+        if action_name in {"MoveAhead"} and event.metadata.get("collided", False):
             reward += self.cfg.env.collision_penalty
             self._episode_collisions += 1
+        elif action_name in {"RotateLeft", "RotateRight"}:
+            reward += self.cfg.env.rotation_penalty
 
         self._prev_geodesic_dist = curr_dist
 

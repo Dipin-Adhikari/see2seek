@@ -3,13 +3,13 @@ evaluate.py — Evaluation entry point.
 
 Usage:
     # Evaluate on ImageNav val split:
-    python evaluate.py --checkpoint data/checkpoints/checkpoint_final.pth --task imagenav
+    python eval.py --checkpoint data/checkpoints/checkpoint_final.pth --task imagenav
 
     # Zero-shot ObjectNav with English text goals:
-    python evaluate.py --checkpoint data/checkpoints/checkpoint_final.pth --task objectnav
+    python eval.py --checkpoint data/checkpoints/checkpoint_final.pth --task objectnav
 
     # Zero-shot ObjectNav with Nepali text goals (our novel contribution):
-    python evaluate.py --checkpoint data/checkpoints/checkpoint_final.pth --task objectnav --language ne
+    python eval.py --checkpoint data/checkpoints/checkpoint_final.pth --task objectnav --language ne
 """
 
 import argparse
