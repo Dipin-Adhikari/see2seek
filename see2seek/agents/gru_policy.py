@@ -4,14 +4,14 @@ gru_policy.py — GRU-based Actor-Critic policy for embodied navigation.
 Architecture (mirrors ZSON's policy, but with our encoder dims):
 
     Input per step:
-        obs_embed        : (B, 512)   ← DINOv2 CLS token
+        obs_embed        : (B, 768)   ← DINOv2 CLS token
         goal_embed       : (B, 512)   ← CLIP   CLS token (pre-cached)
         prev_action_embed: (B, 32)    ← learned embedding of last discrete action
 
-    Concatenation: (B, 1056)
+    Concatenation: (B, 1312)
 
     GRU (single layer, hidden_size=512):
-        input : (seq_len, B, 1056)
+        input : (seq_len, B, 1312)
         output: (seq_len, B, 512)
 
     Actor head  → logits  (B, num_actions)
@@ -27,7 +27,7 @@ Design notes:
 
 Usage:
     policy = GRUActorCritic(
-        policy_input_dim=1056,
+        policy_input_dim=1312,
         hidden_size=512,
         num_actions=4,
     )
@@ -74,7 +74,7 @@ class GRUActorCritic(nn.Module):
 
     Args:
         policy_input_dim: Dimension of the concatenated input vector.
-                          Default 1056 = 512 + 512 + 32.
+                          Default 1312 = 768 + 512 + 32.
         hidden_size:      GRU hidden state size. Default 512.
         num_actions:      Size of the discrete action space. Default 4.
         num_actions_embed:Dimension of the learned prev-action embedding. Default 32.
@@ -84,7 +84,7 @@ class GRUActorCritic(nn.Module):
 
     def __init__(
         self,
-        policy_input_dim: int = 1056,
+        policy_input_dim: int = 1312,
         hidden_size: int = 512,
         num_actions: int = 4,
         num_action_embed: int = 32,
@@ -190,7 +190,7 @@ class GRUActorCritic(nn.Module):
         # 1. Embed previous action
         prev_act_embed = self.prev_action_embed(prev_actions)   # (total_B, 32)
 
-        # 2. Concatenate all inputs: (total_B, 1056)
+        # 2. Concatenate all inputs: (total_B, 1312)
         x = torch.cat([obs_embed, goal_embed, prev_act_embed], dim=-1)
 
         # 3. Reshape to time-major: (chunk_len, num_chunks, features)
@@ -203,7 +203,7 @@ class GRUActorCritic(nn.Module):
         outputs = []
         for t in range(chunk_len):
             h = h * masks_seq[t].unsqueeze(0)              # (1, num_chunks, hidden_size)
-            out_t, h = self.gru(x[t].unsqueeze(0), h)       # x[t]: (num_chunks, 1056)
+            out_t, h = self.gru(x[t].unsqueeze(0), h)       # x[t]: (num_chunks, 1312)
             outputs.append(out_t.squeeze(0))
 
         gru_out = torch.stack(outputs, dim=0).reshape(total_B, self.hidden_size)

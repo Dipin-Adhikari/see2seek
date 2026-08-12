@@ -69,12 +69,27 @@ class DINOv2Encoder(nn.Module):
         self._normalize = normalize
 
         logger.info("Loading DINOv2 ViT-B/14 from torch.hub ...")
-        self._backbone = torch.hub.load(
-            hub_source,
-            "dinov2_vitb14",
-            pretrained=True,
-            verbose=False,
+
+        import os
+        local_repo = os.path.expanduser(
+            "~/.cache/torch/hub/facebookresearch_dinov2_main"
         )
+        if os.path.isdir(local_repo):
+            # Repo already cloned — skip the GitHub network round-trip entirely
+            self._backbone = torch.hub.load(
+                local_repo,
+                "dinov2_vitb14",
+                source="local",
+                pretrained=True,
+                verbose=False,
+            )
+        else:
+            self._backbone = torch.hub.load(
+                hub_source,
+                "dinov2_vitb14",
+                pretrained=True,
+                verbose=False,
+            )
 
         # Freeze all parameters — this encoder is never fine-tuned
         self._freeze()

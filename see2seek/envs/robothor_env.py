@@ -567,13 +567,46 @@ class RoboTHOREnv:
         return True, success
 
     def _get_geodesic_distance(self, goal_pos: Dict) -> float:
-        """Computes current Euclidean distance metrics over the active horizontal XZ traversal layout plane."""
+        """
+        Approximates true (obstacle-aware) geodesic distance to the goal using
+        the episode's precomputed shortest_path waypoints, rather than raw
+        Euclidean straight-line distance.
+
+        Method: find the waypoint on shortest_path nearest to the agent's
+        current position, then sum:
+            (agent -> nearest_waypoint)  [short local hop, still Euclidean
+                                           but small so approximation error
+                                           is bounded]
+          + (nearest_waypoint -> goal, walking along remaining waypoints)
+
+        This is not a true navmesh geodesic (it can't route around obstacles
+        the agent has wandered off-path into), but it tracks the *intended*
+        route far better than straight-line distance, which is what was
+        causing shaping reward to reward walking into walls.
+        """
         agent_pos = self._controller.last_event.metadata["agent"]["position"]
-        dist = np.linalg.norm([
-            agent_pos["x"] - goal_pos["x"],
-            agent_pos["z"] - goal_pos["z"],
-        ])
-        return float(dist)
+        waypoints = self._current_episode["shortest_path"]
+
+        if len(waypoints) < 2:
+            # Degenerate episode (goal essentially at start) — fall back to Euclidean.
+            return float(np.linalg.norm([
+                agent_pos["x"] - goal_pos["x"], agent_pos["z"] - goal_pos["z"],
+            ]))
+
+        # 1. Find index of nearest waypoint to current agent position
+        dists_to_agent = [
+            np.linalg.norm([agent_pos["x"] - wp["x"], agent_pos["z"] - wp["z"]])
+            for wp in waypoints
+        ]
+        nearest_idx = int(np.argmin(dists_to_agent))
+        dist_to_nearest = float(dists_to_agent[nearest_idx])
+
+        # 2. Sum remaining path length from nearest waypoint to goal (last waypoint)
+        remaining = 0.0
+        for a, b in zip(waypoints[nearest_idx:-1], waypoints[nearest_idx + 1:]):
+            remaining += float(np.linalg.norm([a["x"] - b["x"], a["z"] - b["z"]]))
+
+        return dist_to_nearest + remaining
 
     def _compute_path_length(self, waypoints: List[Dict]) -> float:
         """Sum consecutive XZ-plane distances along the shortest_path waypoint list."""
