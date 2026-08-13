@@ -399,6 +399,7 @@ class RoboTHOREnv:
             # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
             goal_pos = ep["shortest_path"][-1]
             self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
+            self._nearest_waypoint_idx: int = 0   # NEW — tracks progress monotonically along shortest_path
 
             # 3b. SPL bookkeeping: L = shortest-path length (sum of segment
             # lengths along the precomputed shortest_path waypoints), and
@@ -477,7 +478,14 @@ class RoboTHOREnv:
         goal_pos = self._current_episode["shortest_path"][-1]
         curr_dist = self._get_geodesic_distance(goal_pos)
 
-        reward = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
+        raw_shaping = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
+        # Clip to a sane per-step range — one MoveAhead step is ~0.25m, so a
+        # single step's shaping reward should never plausibly need to exceed
+        # roughly that scale. Guards against any residual distance-metric
+        # noise (e.g. waypoint-index jumps) from dominating the reward.
+        raw_shaping = float(np.clip(raw_shaping, -0.5, 0.5))
+
+        reward = raw_shaping
         reward += self.cfg.env.slack_reward
 
         if action_name in {"MoveAhead"} and event.metadata.get("collided", False):
@@ -519,6 +527,7 @@ class RoboTHOREnv:
         while restarts < self._max_controller_restarts:
             restarts += 1
             try:
+
                 self._restart_controller()
                 obs = self.reset()
                 info = {
@@ -568,40 +577,46 @@ class RoboTHOREnv:
 
     def _get_geodesic_distance(self, goal_pos: Dict) -> float:
         """
-        Approximates true (obstacle-aware) geodesic distance to the goal using
-        the episode's precomputed shortest_path waypoints, rather than raw
-        Euclidean straight-line distance.
+        Approximates geodesic distance using the episode's shortest_path
+        waypoints, with a MONOTONIC nearest-waypoint search: the search only
+        looks forward from the last known waypoint index, never backward.
 
-        Method: find the waypoint on shortest_path nearest to the agent's
-        current position, then sum:
-            (agent -> nearest_waypoint)  [short local hop, still Euclidean
-                                           but small so approximation error
-                                           is bounded]
-          + (nearest_waypoint -> goal, walking along remaining waypoints)
+        Why monotonic matters: a naive global-nearest search can jump backward
+        between consecutive steps (e.g. if the agent is spatially close to an
+        earlier waypoint due to the path looping or the agent drifting slightly
+        off-route), which causes the computed "remaining distance" to spike
+        even though the agent barely moved. That spike gets read as a large
+        reward penalty for a normal small step, which can destabilize training
+        (confirmed empirically — see training logs from 2026-08-13).
 
-        This is not a true navmesh geodesic (it can't route around obstacles
-        the agent has wandered off-path into), but it tracks the *intended*
-        route far better than straight-line distance, which is what was
-        causing shaping reward to reward walking into walls.
+        Restricting the search to [self._nearest_waypoint_idx, len(waypoints))
+        and only ever advancing that index forward prevents this: "progress"
+        can only be measured as moving further along the intended route, never
+        interpreted as suddenly falling further behind due to search jitter.
         """
         agent_pos = self._controller.last_event.metadata["agent"]["position"]
         waypoints = self._current_episode["shortest_path"]
 
         if len(waypoints) < 2:
-            # Degenerate episode (goal essentially at start) — fall back to Euclidean.
             return float(np.linalg.norm([
                 agent_pos["x"] - goal_pos["x"], agent_pos["z"] - goal_pos["z"],
             ]))
 
-        # 1. Find index of nearest waypoint to current agent position
+        # Search forward-only from the last known index (monotonic).
+        search_start = self._nearest_waypoint_idx
+        candidates = waypoints[search_start:]
         dists_to_agent = [
             np.linalg.norm([agent_pos["x"] - wp["x"], agent_pos["z"] - wp["z"]])
-            for wp in waypoints
+            for wp in candidates
         ]
-        nearest_idx = int(np.argmin(dists_to_agent))
-        dist_to_nearest = float(dists_to_agent[nearest_idx])
+        local_nearest = int(np.argmin(dists_to_agent))
+        nearest_idx = search_start + local_nearest   # absolute index, >= search_start always
 
-        # 2. Sum remaining path length from nearest waypoint to goal (last waypoint)
+        # Update tracked index — monotonic, never decreases.
+        self._nearest_waypoint_idx = nearest_idx
+
+        dist_to_nearest = float(dists_to_agent[local_nearest])
+
         remaining = 0.0
         for a, b in zip(waypoints[nearest_idx:-1], waypoints[nearest_idx + 1:]):
             remaining += float(np.linalg.norm([a["x"] - b["x"], a["z"] - b["z"]]))
