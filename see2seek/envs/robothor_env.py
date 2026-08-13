@@ -582,27 +582,34 @@ class RoboTHOREnv:
     def _get_geodesic_distance(self, goal_pos: Dict) -> float:
         """
         True geodesic distance via AI2-THOR's native pathfinding engine
-        (GetShortestPathToPoint), rather than an approximation from static
-        precomputed waypoints. This queries the actual navmesh, so it
-        correctly accounts for walls/obstacles at the agent's CURRENT
-        position — not just along the dataset's precomputed shortest_path.
+        (GetShortestPathToPoint), called directly via controller.step()
+        rather than through ai2thor.util.metrics.get_shortest_path_to_point,
+        whose argument packaging doesn't match this AI2-THOR version's
+        actual action signature.
 
-        Falls back to Euclidean distance if pathfinding fails (e.g. agent is
-        in an unreachable pose, or a transient engine hiccup) — this should
-        be rare, but must not crash a training rollout.
+        Verified signature for this build: `position` takes the start point
+        as a Vector3 dict, and the target is passed as flat `x`/`y`/`z`
+        kwargs (NOT a nested `target` dict) — confirmed via a standalone
+        controller.step() smoke test against GetReachablePositions output.
         """
         agent_pos = self._controller.last_event.metadata["agent"]["position"]
 
         try:
-            corners = get_shortest_path_to_point(
-                self._controller,
-                initial_position=agent_pos,
-                target_position=goal_pos,
+            event = self._controller.step(
+                action="GetShortestPathToPoint",
+                position=agent_pos,
+                x=goal_pos["x"],
+                y=goal_pos["y"],
+                z=goal_pos["z"],
+                allowedError=0.05,
             )
+            if not event.metadata.get("lastActionSuccess", False):
+                raise ValueError(event.metadata.get("errorMessage", "unknown error"))
+
+            corners = event.metadata["actionReturn"]["corners"]
             return float(path_distance(corners))
-        except ValueError as e:
-            # Pathfinding failed (e.g. no valid path found from current pose).
-            # Fall back to Euclidean rather than crashing the episode/worker.
+
+        except (ValueError, KeyError) as e:
             logger.warning(
                 f"GetShortestPathToPoint failed at step {self._num_steps} "
                 f"(episode={self._current_episode.get('id', '?')}): {e} "
@@ -611,7 +618,7 @@ class RoboTHOREnv:
             return float(np.linalg.norm([
                 agent_pos["x"] - goal_pos["x"], agent_pos["z"] - goal_pos["z"],
             ]))
-
+    
     def _compute_path_length(self, waypoints: List[Dict]) -> float:
         """Sum consecutive XZ-plane distances along the shortest_path waypoint list."""
         if len(waypoints) < 2:
