@@ -69,6 +69,9 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+from ai2thor.util.metrics import get_shortest_path_to_point, path_distance
+
+
 logger = logging.getLogger(__name__)
 
 # ===========================================================================
@@ -397,9 +400,9 @@ class RoboTHOREnv:
                 continue
 
             # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
+
             goal_pos = ep["shortest_path"][-1]
             self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
-            self._nearest_waypoint_idx: int = 0   # NEW — tracks progress monotonically along shortest_path
 
             # 3b. SPL bookkeeping: L = shortest-path length (sum of segment
             # lengths along the precomputed shortest_path waypoints), and
@@ -575,53 +578,39 @@ class RoboTHOREnv:
         success = dist <= self.cfg.env.success_distance
         return True, success
 
+
     def _get_geodesic_distance(self, goal_pos: Dict) -> float:
         """
-        Approximates geodesic distance using the episode's shortest_path
-        waypoints, with a MONOTONIC nearest-waypoint search: the search only
-        looks forward from the last known waypoint index, never backward.
+        True geodesic distance via AI2-THOR's native pathfinding engine
+        (GetShortestPathToPoint), rather than an approximation from static
+        precomputed waypoints. This queries the actual navmesh, so it
+        correctly accounts for walls/obstacles at the agent's CURRENT
+        position — not just along the dataset's precomputed shortest_path.
 
-        Why monotonic matters: a naive global-nearest search can jump backward
-        between consecutive steps (e.g. if the agent is spatially close to an
-        earlier waypoint due to the path looping or the agent drifting slightly
-        off-route), which causes the computed "remaining distance" to spike
-        even though the agent barely moved. That spike gets read as a large
-        reward penalty for a normal small step, which can destabilize training
-        (confirmed empirically — see training logs from 2026-08-13).
-
-        Restricting the search to [self._nearest_waypoint_idx, len(waypoints))
-        and only ever advancing that index forward prevents this: "progress"
-        can only be measured as moving further along the intended route, never
-        interpreted as suddenly falling further behind due to search jitter.
+        Falls back to Euclidean distance if pathfinding fails (e.g. agent is
+        in an unreachable pose, or a transient engine hiccup) — this should
+        be rare, but must not crash a training rollout.
         """
         agent_pos = self._controller.last_event.metadata["agent"]["position"]
-        waypoints = self._current_episode["shortest_path"]
 
-        if len(waypoints) < 2:
+        try:
+            corners = get_shortest_path_to_point(
+                self._controller,
+                initial_position=agent_pos,
+                target_position=goal_pos,
+            )
+            return float(path_distance(corners))
+        except ValueError as e:
+            # Pathfinding failed (e.g. no valid path found from current pose).
+            # Fall back to Euclidean rather than crashing the episode/worker.
+            logger.warning(
+                f"GetShortestPathToPoint failed at step {self._num_steps} "
+                f"(episode={self._current_episode.get('id', '?')}): {e} "
+                f"— falling back to Euclidean distance for this step."
+            )
             return float(np.linalg.norm([
                 agent_pos["x"] - goal_pos["x"], agent_pos["z"] - goal_pos["z"],
             ]))
-
-        # Search forward-only from the last known index (monotonic).
-        search_start = self._nearest_waypoint_idx
-        candidates = waypoints[search_start:]
-        dists_to_agent = [
-            np.linalg.norm([agent_pos["x"] - wp["x"], agent_pos["z"] - wp["z"]])
-            for wp in candidates
-        ]
-        local_nearest = int(np.argmin(dists_to_agent))
-        nearest_idx = search_start + local_nearest   # absolute index, >= search_start always
-
-        # Update tracked index — monotonic, never decreases.
-        self._nearest_waypoint_idx = nearest_idx
-
-        dist_to_nearest = float(dists_to_agent[local_nearest])
-
-        remaining = 0.0
-        for a, b in zip(waypoints[nearest_idx:-1], waypoints[nearest_idx + 1:]):
-            remaining += float(np.linalg.norm([a["x"] - b["x"], a["z"] - b["z"]]))
-
-        return dist_to_nearest + remaining
 
     def _compute_path_length(self, waypoints: List[Dict]) -> float:
         """Sum consecutive XZ-plane distances along the shortest_path waypoint list."""
