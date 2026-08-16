@@ -68,6 +68,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 logger = logging.getLogger(__name__)
@@ -126,17 +127,25 @@ class SpatialCompressionHead(nn.Module):
             nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
         )
-        # Scale-matching note: the goal branch (CLIP, see clip_encoder.py)
-        # is L2-normalised — unit magnitude, bounded per-dim. This branch's
-        # raw post-ReLU conv output has no such constraint and its scale
-        # drifts freely as the CNN trains. Without normalisation here, an
-        # unbounded 1568-dim vector sitting next to a unit-norm 512-dim
-        # vector in the concat can structurally dominate the fused input by
-        # magnitude alone, independent of which branch is actually more
-        # informative — this can starve the GRU of goal signal in a way
-        # that looks like "stuck training" (flat entropy/value_loss) rather
-        # than an obvious bug. LayerNorm here fixes the scale at each
-        # forward pass regardless of what the conv weights converge to.
+        # Scale-matching note: the goal branch (CLIP, see clip_encoder.py) is
+        # L2-normalised to an exact unit vector norm (||goal|| == 1.0). This
+        # branch's raw post-ReLU conv output has no such constraint.
+        #
+        # IMPORTANT — LayerNorm alone does NOT fix this. LayerNorm normalises
+        # each element to ~zero-mean/unit-VARIANCE, not the vector's total L2
+        # norm. For a D-dim vector with each element at ~unit variance, the L2
+        # norm is ~sqrt(D), not ~1. Measured empirically via
+        # GRUActorCritic.branch_norms(): LayerNorm(1568) alone produced
+        # spatial norm ~39.6 == sqrt(1568), while the goal branch is 1.0 —
+        # a ~40x gap, i.e. LayerNorm alone did not close the scale mismatch it
+        # was added to fix. F.normalize() below rescales the *total* vector
+        # norm to exactly 1.0, matching the goal branch's actual scale rather
+        # than just equalising per-element variance. (Using an explicit L2
+        # normalize rather than a fixed 1/sqrt(D) constant multiplier because
+        # it's exact regardless of what the conv weights converge to during
+        # training — a fixed constant is only an approximation, and gets
+        # worse if a nonlinearity after the norm distorts the distribution,
+        # as happens in cls_proj below.)
         self.norm = nn.LayerNorm(32 * 7 * 7)
 
     @property
@@ -148,7 +157,8 @@ class SpatialCompressionHead(nn.Module):
         Args:
             patch_tokens: (B, num_patches, C) where num_patches == grid_size**2.
         Returns:
-            (B, output_dim) flattened, LayerNorm-scaled spatial feature vector.
+            (B, output_dim) flattened spatial feature vector, L2-normalised
+            to unit norm (matching the goal branch's scale exactly).
         """
         B, num_patches, C = patch_tokens.shape
         g = self.grid_size
@@ -160,7 +170,8 @@ class SpatialCompressionHead(nn.Module):
         x = patch_tokens.view(B, g, g, C).permute(0, 3, 1, 2).contiguous()  # (B, C, g, g)
         x = self.conv(x)                    # (B, 32, 7, 7)
         x = x.flatten(start_dim=1)          # (B, 1568)
-        x = self.norm(x)                    # (B, 1568), scale-matched to goal branch
+        x = self.norm(x)                    # unit per-element variance (training stability)
+        x = F.normalize(x, p=2, dim=-1)     # exact unit L2 norm (scale parity with goal)
         return x
 
 
@@ -326,13 +337,21 @@ class GRUActorCritic(nn.Module):
         Returns:
             (B, policy_input_dim)
         """
-        spatial_feat = self.spatial_head(patch_embeds)          # (B, 1568)
+        spatial_feat = self.spatial_head(patch_embeds)          # (B, 1568), unit L2 norm
         prev_act_embed = self.prev_action_embed(prev_actions)   # (B, 32)
 
         parts = [spatial_feat]
         if self.use_cls:
-            parts.append(self.cls_proj(cls_embed))              # (B, 64)
-        parts.append(goal_embed)                                # (B, 512), raw
+            cls_feat = self.cls_proj(cls_embed)                  # (B, 64)
+            # Same scale-parity fix as the spatial branch: LinearNormAct's
+            # internal LayerNorm gives unit per-element variance (L2 norm
+            # ~sqrt(64)=8), then ELU distorts that further (observed ~6.7 in
+            # branch_norms() logging) — neither matches goal's exact unit
+            # L2 norm. Explicit L2 normalize here is exact regardless of
+            # what the ELU does to the distribution.
+            cls_feat = F.normalize(cls_feat, p=2, dim=-1)
+            parts.append(cls_feat)                               # (B, 64), unit L2 norm
+        parts.append(goal_embed)                                # (B, 512), raw, unit L2 norm
         parts.append(prev_act_embed)                             # (B, 32)
 
         return torch.cat(parts, dim=-1)
@@ -470,15 +489,18 @@ class GRUActorCritic(nn.Module):
 
         Returns:
             dict with keys 'spatial', 'cls' (only if use_cls), 'goal',
-            each a Python float (batch-mean L2 norm).
+            each a Python float (batch-mean L2 norm). With the current
+            L2-normalize-to-unit-norm treatment on spatial/cls, both should
+            read ~1.0, matching goal's exact 1.0 — if they don't, something
+            is broken in the normalization path itself.
         """
-        spatial_feat = self.spatial_head(patch_embeds)   # (B, 1568), post-LayerNorm
+        spatial_feat = self.spatial_head(patch_embeds)   # (B, 1568), unit L2 norm
         norms = {
             "spatial": spatial_feat.norm(dim=-1).mean().item(),
             "goal": goal_embed.norm(dim=-1).mean().item(),
         }
         if self.use_cls:
-            cls_feat = self.cls_proj(cls_embed)           # (B, 64)
+            cls_feat = F.normalize(self.cls_proj(cls_embed), p=2, dim=-1)  # (B, 64), unit L2 norm
             norms["cls"] = cls_feat.norm(dim=-1).mean().item()
         return norms
 
