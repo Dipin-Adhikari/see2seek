@@ -273,6 +273,15 @@ class PPOTrainer:
                     patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks
                 )
 
+                # ---- Branch-norm diagnostic (gated to avoid log spam) ----
+                # Reuses the observation just encoded above — no extra
+                # DINOv2/CLIP forward passes. Confirms directly whether the
+                # spatial branch's scale is comparable to the goal branch's
+                # (see SpatialCompressionHead's LayerNorm), rather than
+                # inferring it indirectly from entropy/value_loss trends.
+                if self._num_updates % cfg.ppo.log_interval == 0:
+                    self._log_branch_norms(patch_embed, cls_embed, goal_embed)
+
             self.buffer.compute_returns(
                 last_value  = last_value.squeeze(-1),
                 gamma       = cfg.ppo.gamma,
@@ -369,6 +378,25 @@ class PPOTrainer:
             metrics[k] /= max(num_batches, 1)
 
         return metrics
+
+    def _log_branch_norms(
+        self,
+        patch_embed: torch.Tensor,
+        cls_embed: torch.Tensor,
+        goal_embed: torch.Tensor,
+    ) -> None:
+        """Log mean L2 norm of each fusion branch (spatial / cls / goal) as
+        they enter the concat, so scale parity between branches (e.g. after
+        adding LayerNorm to SpatialCompressionHead) can be verified directly
+        instead of inferred from downstream loss curves."""
+        norms = self.policy.branch_norms(patch_embed, cls_embed, goal_embed)
+        parts = "  ".join(f"{name}={val:.3f}" for name, val in norms.items())
+        logger.info(f"    branch_norms — {parts}")
+
+        if self._wandb is not None:
+            self._wandb.log({
+                f"branch_norms/{name}": val for name, val in norms.items()
+            })
 
     def _log_per_action_rewards(self) -> None:
         """Log mean reward per action type from the just-collected rollout buffer.

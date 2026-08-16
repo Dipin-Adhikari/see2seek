@@ -449,6 +449,39 @@ class GRUActorCritic(nn.Module):
         """Return a zeroed GRU hidden state for episode start."""
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
 
+    @torch.no_grad()
+    def branch_norms(
+        self,
+        patch_embeds: torch.Tensor,
+        cls_embed: torch.Tensor,
+        goal_embed: torch.Tensor,
+    ) -> dict:
+        """
+        Diagnostic: mean per-sample L2 norm of each fusion branch, exactly as
+        they enter the concatenation in _fuse_inputs(). Use this to directly
+        verify branch scale parity (e.g. after adding LayerNorm to
+        SpatialCompressionHead) instead of inferring it indirectly from noisy
+        downstream RL metrics like entropy/value_loss.
+
+        A large, persistent gap between 'spatial' and 'goal' here means one
+        branch can structurally dominate the fused vector by magnitude alone,
+        independent of which is actually more informative — worth checking
+        any time training looks stuck.
+
+        Returns:
+            dict with keys 'spatial', 'cls' (only if use_cls), 'goal',
+            each a Python float (batch-mean L2 norm).
+        """
+        spatial_feat = self.spatial_head(patch_embeds)   # (B, 1568), post-LayerNorm
+        norms = {
+            "spatial": spatial_feat.norm(dim=-1).mean().item(),
+            "goal": goal_embed.norm(dim=-1).mean().item(),
+        }
+        if self.use_cls:
+            cls_feat = self.cls_proj(cls_embed)           # (B, 64)
+            norms["cls"] = cls_feat.norm(dim=-1).mean().item()
+        return norms
+
 
 # ---------------------------------------------------------------------------
 # Factory
