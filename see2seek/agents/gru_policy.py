@@ -126,6 +126,18 @@ class SpatialCompressionHead(nn.Module):
             nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
         )
+        # Scale-matching note: the goal branch (CLIP, see clip_encoder.py)
+        # is L2-normalised — unit magnitude, bounded per-dim. This branch's
+        # raw post-ReLU conv output has no such constraint and its scale
+        # drifts freely as the CNN trains. Without normalisation here, an
+        # unbounded 1568-dim vector sitting next to a unit-norm 512-dim
+        # vector in the concat can structurally dominate the fused input by
+        # magnitude alone, independent of which branch is actually more
+        # informative — this can starve the GRU of goal signal in a way
+        # that looks like "stuck training" (flat entropy/value_loss) rather
+        # than an obvious bug. LayerNorm here fixes the scale at each
+        # forward pass regardless of what the conv weights converge to.
+        self.norm = nn.LayerNorm(32 * 7 * 7)
 
     @property
     def output_dim(self) -> int:
@@ -136,7 +148,7 @@ class SpatialCompressionHead(nn.Module):
         Args:
             patch_tokens: (B, num_patches, C) where num_patches == grid_size**2.
         Returns:
-            (B, output_dim) flattened spatial feature vector.
+            (B, output_dim) flattened, LayerNorm-scaled spatial feature vector.
         """
         B, num_patches, C = patch_tokens.shape
         g = self.grid_size
@@ -148,6 +160,7 @@ class SpatialCompressionHead(nn.Module):
         x = patch_tokens.view(B, g, g, C).permute(0, 3, 1, 2).contiguous()  # (B, C, g, g)
         x = self.conv(x)                    # (B, 32, 7, 7)
         x = x.flatten(start_dim=1)          # (B, 1568)
+        x = self.norm(x)                    # (B, 1568), scale-matched to goal branch
         return x
 
 
