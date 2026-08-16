@@ -1,4 +1,4 @@
-ai2thor==4.3.0
+ai2thor==5.0.0
 ai2thor-colab==0.1.2
 annotated-doc==0.0.4
 annotated-types==0.7.0

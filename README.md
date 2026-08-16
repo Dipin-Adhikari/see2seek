@@ -112,3 +112,50 @@ The project expects:
 - checkpoints in `data/checkpoints/`
 - training logs under `data/logs/` or `logs/`
 
+
+## Architecture
+
+High-level model architecture used by See2Seek:
+
+- Observation encoder: frozen DINOv2 ViT-B/14. Produces a CLS token (`(B,768)`) and a flat grid of patch tokens (`(B,256,768)`) corresponding to a 16x16 patch grid over a 224x224 input.
+- Goal encoder: frozen CLIP ViT-B/32. Produces a 512-dim goal embedding (fed raw into the policy).
+- SpatialCompressionHead (trainable): a 2-layer CNN that compresses DINOv2 patch tokens into a spatial feature map (32 x 7 x 7) and flattens to a 1568-dim vector. Conv sequence: Conv2d(768→128, k=3, s=2) -> (B,128,7,7), Conv2d(128→32, k=3, s=1, p=1) -> (B,32,7,7) → flatten (32*7*7 = 1568).
+- CLS projection (trainable, ablatable): small Linear→LayerNorm→ELU projection of the DINOv2 CLS token to 64 dims (enabled by default via `use_cls`).
+- Previous-action embedding (trainable): learned embedding of the last discrete action (default 32-dim).
+
+Fusion and recurrent policy:
+
+- The policy concatenates: spatial compressed vector (1568) + CLS projection (64, if enabled) + goal raw embedding (512) + prev-action embedding (32). With `use_cls=True` this yields a 2176-dim policy input (1568 + 64 + 512 + 32). If `use_cls=False`, the input is 2112-dim.
+- Recurrent core: single-layer GRU (hidden size 512 by default). Actor and critic heads are small MLPs (default intermediate dims 256).
+
+Design notes:
+
+- The DINOv2 and CLIP backbones are frozen (no gradients). The SpatialCompressionHead and CLS projection are trainable; therefore the training pipeline re-runs the compression/projection inside policy evaluation so gradients flow correctly. The rollout buffer stores raw DINOv2 outputs (patch tokens and CLS tokens) rather than pre-compressed vectors.
+- The fusion is a flat concatenation (single fusion point) following the ZSON/EmbCLIP-inspired design adopted in this project.
+
+## Reward function
+
+The environment uses geodesic-distance-based dense shaping with a terminal success bonus. In formula form, each intermediate step reward is:
+
+ r_t = geodesic_reward_scale * Δgeodesic_distance + slack_reward
+
+where Δgeodesic_distance is the decrease (negative if moving away) in shortest-path distance to the goal between consecutive timesteps. On calling `Stop` when the agent is within `success_distance` metres of the goal, the agent receives `success_reward` and the episode terminates.
+
+Defaults (see `see2seek/utils/config.py`):
+
+- `success_reward`: 4.0
+- `slack_reward`: -0.01 (small step penalty)
+- `geodesic_reward_scale`: 1.0 (multiplies the geodesic-distance delta)
+- `success_distance`: 1.0 metre
+- `collision_penalty`: -0.01 (penalty applied on collision events)
+- `rotation_penalty`: -0.015 (small penalty per rotation step)
+- `max_steps`: 500 (episode horizon)
+- `min_steps_before_stop`: 5 (disallow `Stop` before this many steps)
+
+Notes:
+
+- If `Stop` is called but the agent is not within `success_distance`, the terminal reward for that action is 0 (no success bonus).
+- Geodesic distances and shortest paths are computed using the AI2-THOR utilities (`get_shortest_path_to_point`, `path_distance`) in the environment wrapper.
+- The shaping encourages motion that reduces true navigable distance to the goal rather than only visual similarity.
+
+

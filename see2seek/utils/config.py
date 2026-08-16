@@ -5,15 +5,32 @@ All hyperparameters, paths, and environment settings live here.
 Change values here rather than in individual modules so the entire
 project stays in sync. YAML overrides are loaded on top of these defaults.
 
-Architecture note (matches ZSON embedding layout):
-    obs_embed_dim   = 512   (DINOv2 ViT-B/14 CLS token)
-    goal_embed_dim  = 512   (CLIP   ViT-B/32  CLS token)
-    action_embed_dim= 32    (learned embedding of previous discrete action)
-    policy_input_dim= 1312  (concatenation of the three above)
+Architecture note (ZSON/EmbCLIP-inspired spatial fusion — see gru_policy.py):
+    Spatial branch  (trainable SpatialCompressionHead): 1568-dim
+        DINOv2 patch tokens (256 x 768, 16x16 grid) -> 2-layer CNN -> 32x7x7 -> flatten
+        1568 = 32 * 7 * 7 is a FIXED consequence of SpatialCompressionHead's
+        conv architecture (see spatial_compressed_dim below) — it is not
+        independently tunable from this config without also changing the
+        conv kernel/stride in gru_policy.py.
+    CLS branch      (trainable projection, ablatable via use_cls): 64-dim
+        DINOv2 CLS token (768) -> Linear/LayerNorm/ELU -> 64
+    Goal branch     (fed raw, no projection): 512-dim
+        CLIP ViT-B/32 image/text embedding, unchanged.
+    Previous-action branch: 32-dim
+        Learned embedding of the last discrete action.
+
+    policy_input_dim = spatial_compressed_dim
+                      + (cls_proj_dim if use_cls else 0)
+                      + goal_embed_dim
+                      + action_embed_dim
+                      = 1568 + 64 + 512 + 32 = 2176   (use_cls=True, default)
+                      = 1568 +  0 + 512 + 32 = 2112   (use_cls=False)
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -27,16 +44,16 @@ class EnvConfig:
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
     split: str = "train"                    # "train" | "val" | "test"
-    # split: str = "val"
+    split: str = "val"
 
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -75,17 +92,35 @@ class EnvConfig:
 
 @dataclass
 class EncoderConfig:
-    """Frozen visual encoder settings."""
+    """Frozen visual encoder settings + fusion architecture parameters."""
 
     # --- Observation encoder: DINOv2 ViT-B/14 ---
     obs_encoder: str = "dinov2_vitb14"     # torch.hub model name
-    obs_embed_dim: int = 768               # DINOv2 ViT-B output dim (CLS token)
+    obs_embed_dim: int = 768               # DINOv2 ViT-B CLS token dim (kept
+                                            # for backward-compat references
+                                            # elsewhere; equals dino_cls_dim)
     obs_freeze: bool = True                # always frozen; never fine-tuned
     obs_normalize: bool = True             # ImageNet-style normalisation
 
+    # --- DINOv2 patch-token / spatial-branch settings (new) ---
+    dino_patch_dim: int = 768              # per-patch token width
+    dino_grid_size: int = 16               # 224 / 14 = 16 -> 16x16 patch grid
+    dino_cls_dim: int = 768                # CLS token width (== obs_embed_dim)
+
+    # Fixed by SpatialCompressionHead's conv architecture in gru_policy.py
+    # (Conv2d k3/s2 16->7, Conv2d k3/s1/pad1 7->7, 32 channels -> 32*7*7).
+    # Not independently overridable from here without also changing the
+    # conv layers themselves — kept as an explicit constant so
+    # policy_input_dim below stays correct and self-documenting.
+    spatial_compressed_dim: int = 1568
+
+    # --- CLS branch (trainable projection, ablatable) ---
+    cls_proj_dim: int = 64                 # CLS -> small linear projection width
+    use_cls: bool = True                   # ablation switch: drop CLS branch entirely
+
     # --- Goal encoder: CLIP ViT-B/32 ---
     goal_encoder: str = "ViT-B/32"        # open_clip model name
-    goal_embed_dim: int = 512              # CLIP image embed dim
+    goal_embed_dim: int = 512              # CLIP image embed dim (fed RAW, unprojected)
     goal_freeze: bool = True
     goal_normalize: bool = True
 
@@ -93,10 +128,14 @@ class EncoderConfig:
     action_embed_dim: int = 32             # dim of learned prev-action embedding
 
     # --- Combined policy input ---
-    # policy_input_dim = obs_embed_dim + goal_embed_dim + action_embed_dim
+    # policy_input_dim = spatial_compressed_dim
+    #                   + (cls_proj_dim if use_cls else 0)
+    #                   + goal_embed_dim
+    #                   + action_embed_dim
     @property
     def policy_input_dim(self) -> int:
-        return self.obs_embed_dim + self.goal_embed_dim + self.action_embed_dim
+        cls_dim = self.cls_proj_dim if self.use_cls else 0
+        return self.spatial_compressed_dim + cls_dim + self.goal_embed_dim + self.action_embed_dim
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +185,16 @@ class PPOConfig:
     total_num_steps: int = 10000000     # total env steps 
     checkpoint_interval: int = 50000    # save every N env steps
     log_interval: int = 10                # log every N PPO updates
+
+    # --- RolloutBuffer memory knobs (new — see rollout_buffer.py docstring) ---
+    # Storing raw DINOv2 patch tokens (256 x 768 per step-env) is far larger
+    # than the old CLS-only buffer (~1.6GB at num_steps=128, num_envs=16 in
+    # fp32). buffer_store_dtype defaults to fp16 to roughly halve that.
+    # buffer_storage_device=None means "same as cfg.device"; set to
+    # torch.device("cpu") if the L4's 24GB VRAM gets tight alongside the
+    # policy/optimizer/DINOv2/CLIP footprint.
+    buffer_storage_device: Optional[torch.device] = None
+    buffer_store_dtype: torch.dtype = torch.float16
 
 
 # ---------------------------------------------------------------------------

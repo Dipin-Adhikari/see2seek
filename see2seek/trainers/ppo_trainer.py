@@ -4,6 +4,8 @@ ppo_trainer.py — Proximal Policy Optimisation trainer for recurrent policies.
 Implements the full training loop:
     1. Collect `num_steps` steps from `num_envs` parallel environments.
     2. Encode observations and goals with frozen encoders (DINOv2 + CLIP).
+       DINOv2 is called ONCE per frame via get_all_embeddings(), returning
+       both the CLS token and the patch-token grid — see dino_encoder.py.
     3. Compute GAE returns and advantages.
     4. Run `num_epochs` epochs of mini-batch PPO updates.
     5. Log to W&B and save checkpoints.
@@ -29,7 +31,6 @@ import logging
 import os
 import time
 from collections import deque
-# from turtle import done
 from typing import Optional
 
 import torch
@@ -73,8 +74,7 @@ class PPOTrainer:
             normalize=cfg.encoder.goal_normalize,
         )
 
-
-        # ---- Policy (trainable) ----
+        # ---- Policy (trainable — includes SpatialCompressionHead + CLS proj) ----
         logger.info("Building GRU Actor-Critic policy ...")
         self.policy = build_policy(cfg, cfg.device)
 
@@ -90,14 +90,22 @@ class PPOTrainer:
         self.vec_env = make_vec_envs(cfg)
 
         # ---- Rollout buffer ----
+        # storage_device/store_dtype are optional memory knobs — see
+        # rollout_buffer.py docstring. Defaulting storage to the same
+        # compute device here; if you hit OOM at your num_steps/num_envs,
+        # pass storage_device=torch.device("cpu") instead.
         self.buffer = RolloutBuffer(
             num_steps=cfg.ppo.num_steps,
             num_envs=cfg.env.num_envs,
-            obs_dim=cfg.encoder.obs_embed_dim,
+            patch_dim=self.obs_encoder.patch_dim,
+            num_patches=self.obs_encoder.num_patches,
+            cls_dim=self.obs_encoder.embed_dim,
             goal_dim=cfg.encoder.goal_embed_dim,
             hidden_size=cfg.policy.hidden_size,
             num_actions=cfg.env.num_actions,
             device=self.device,
+            storage_device=getattr(cfg.ppo, "buffer_storage_device", None),
+            store_dtype=getattr(cfg.ppo, "buffer_store_dtype", torch.float16),
         )
 
         # ---- Training state ----
@@ -161,11 +169,12 @@ class PPOTrainer:
         logger.info(f"  Total env steps : {cfg.ppo.total_num_steps:,}")
         logger.info(f"  Num envs        : {cfg.env.num_envs}")
         logger.info(f"  Steps per rollout: {cfg.ppo.num_steps}")
+        logger.info(f"  Policy input dim : {self.policy.policy_input_dim}")
 
         # Reset all environments and get initial observations
         obs_dict = self.vec_env.reset_all()
         # obs_dict["rgb"]  : (N, 3, H, W) on CPU
-        # obs_dict["goal"] : (N, 3, H, W) on CPU
+        # obs_dict["goal"] : (N, 512)     on CPU
 
         # Initial hidden state (all zeros at training start)
         hidden = self.policy.get_initial_hidden(cfg.env.num_envs, self.device)
@@ -174,7 +183,7 @@ class PPOTrainer:
             (cfg.env.num_envs,), cfg.env.num_actions, dtype=torch.long, device=self.device
         )   # num_actions index = "no previous action" padding
 
-        steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)   
+        steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)
         while self._total_steps < cfg.ppo.total_num_steps:
             # ---- Phase 1: Collect rollout ----
             self.policy.eval()    # eval for rollout (no dropout)
@@ -182,9 +191,14 @@ class PPOTrainer:
 
             for _ in range(cfg.ppo.num_steps):
                 with torch.no_grad():
-                    # 1a. Encode observation (DINOv2 — frozen)
-                    rgb = obs_dict["rgb"].to(self.device)          # (N, 3, H, W)
-                    obs_embed = self.obs_encoder(rgb)              # (N, 512)
+                    # 1a. Encode observation (DINOv2 — frozen). Single
+                    # backbone forward pass returns BOTH CLS and patch
+                    # tokens — do not call forward()/get_patch_embeddings()
+                    # separately here, that would run the ViT twice.
+                    rgb = obs_dict["rgb"].to(self.device)                    # (N, 3, H, W)
+                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                    # cls_embed:   (N, 768)
+                    # patch_embed: (N, 256, 768)
 
                     # 1b. Encode goal (CLIP — frozen; cached)
                     goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
@@ -193,7 +207,8 @@ class PPOTrainer:
 
                     # 1c. Policy forward
                     dist, value, hidden_next = self.policy.act(
-                        obs_embed, goal_embed, prev_actions, hidden, masks, can_stop=can_stop
+                        patch_embed, cls_embed, goal_embed, prev_actions,
+                        hidden, masks, can_stop=can_stop,
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
@@ -222,9 +237,12 @@ class PPOTrainer:
                 # 1e. Build masks for NEXT step (0 if this step was terminal)
                 new_masks = (~dones).float().unsqueeze(1).to(self.device)  # (N, 1)
 
-                # 1f. Insert into buffer
+                # 1f. Insert into buffer (raw patch/CLS tokens — the
+                # trainable SpatialCompressionHead / CLS proj re-run on
+                # these during evaluate_actions()).
                 self.buffer.insert(
-                    obs_embed   = obs_embed,
+                    patch_embed = patch_embed,
+                    cls_embed   = cls_embed,
                     goal_embed  = goal_embed,
                     action      = actions,
                     prev_action = prev_actions,
@@ -246,14 +264,13 @@ class PPOTrainer:
             if self._num_updates % cfg.ppo.log_interval == 0:
                 self._log_per_action_rewards()
 
-
             # ---- Phase 2: Compute returns ----
             with torch.no_grad():
                 rgb = obs_dict["rgb"].to(self.device)
-                obs_embed  = self.obs_encoder(rgb)
+                cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
                 goal_embed = self._get_goal_embeddings(obs_dict)
                 _, last_value, _ = self.policy.act(
-                    obs_embed, goal_embed, prev_actions, hidden, masks
+                    patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks
                 )
 
             self.buffer.compute_returns(
@@ -303,15 +320,20 @@ class PPOTrainer:
         for _ in range(cfg.ppo.num_epochs):
             for batch in self.buffer.recurrent_mini_batches(cfg.ppo.num_mini_batches):
 
-                # Re-evaluate actions under current policy
+                # Re-evaluate actions under current policy. This re-runs the
+                # trainable SpatialCompressionHead + CLS projection on the
+                # RAW patch/CLS tokens stored in the buffer, so gradients
+                # flow into them here (they were run under no_grad() during
+                # rollout collection).
                 log_probs, values, entropy = self.policy.evaluate_actions(
-                    obs_embed    = batch.obs_embeds,
+                    patch_embeds = batch.patch_embeds,
+                    cls_embed    = batch.cls_embeds,
                     goal_embed   = batch.goal_embeds,
                     prev_actions = batch.prev_actions,
                     hidden       = batch.hidden_states,
                     masks        = batch.masks,
                     actions      = batch.actions,
-                    can_stop     = batch.can_stop, 
+                    can_stop     = batch.can_stop,
                 )
 
                 # PPO clipped policy loss
@@ -359,7 +381,6 @@ class PPOTrainer:
             if count > 0:
                 mean_r = self.buffer.rewards[:T][mask].mean().item()
                 logger.info(f"    action={a_name:12s} count={count:6d} mean_reward={mean_r:+.4f}")
-    
 
     # ------------------------------------------------------------------
     # Goal embedding helper
@@ -370,9 +391,10 @@ class PPOTrainer:
         Fetches the pre-calculated 512-d goal embedding directly from the environment.
         """
         return obs_dict["goal"].to(self.device)
-        # ------------------------------------------------------------------
-        # Checkpoint I/O
-        # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Checkpoint I/O
+    # ------------------------------------------------------------------
 
     def _save_checkpoint(self, final: bool = False) -> None:
         """Save policy weights, optimiser state, and training metadata."""
@@ -399,8 +421,6 @@ class PPOTrainer:
         self._total_steps = ckpt.get("total_steps", 0)
         self._num_updates = ckpt.get("num_updates", 0)
         logger.info(f"Resumed at step {self._total_steps:,}")
-
-        
 
     # ------------------------------------------------------------------
     # Logging

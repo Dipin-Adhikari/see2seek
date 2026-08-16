@@ -598,9 +598,7 @@ class RoboTHOREnv:
             event = self._controller.step(
                 action="GetShortestPathToPoint",
                 position=agent_pos,
-                x=goal_pos["x"],
-                y=goal_pos["y"],
-                z=goal_pos["z"],
+                target=goal_pos,
                 allowedError=0.05,
             )
             if not event.metadata.get("lastActionSuccess", False):
