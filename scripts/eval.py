@@ -15,7 +15,6 @@ Usage:
 import argparse
 import logging
 
-
 def parse_args():
     p = argparse.ArgumentParser(description="See to Seek — Evaluation")
     p.add_argument("--checkpoint", required=True, help="Path to .pth checkpoint")

@@ -138,17 +138,18 @@ class Evaluator:
             for step in range(self.cfg.env.max_steps):
                 with torch.no_grad():
                     rgb = obs_dict["rgb"].unsqueeze(0).to(self.device)
-                    obs_embed = self.obs_encoder(rgb)              # (1, 512)
+                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                    pointgoal = obs_dict["pointgoal"].unsqueeze(0).to(self.device)
                     can_stop = torch.tensor(
                         [step >= self.cfg.env.min_steps_before_stop], device=self.device
                     )
                     dist, _, hidden = self.policy.act(
-                        obs_embed, goal_embed, prev_action, hidden, masks, can_stop=can_stop
+                        patch_embed, cls_embed, goal_embed, prev_action,
+                        hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
                     )
                     if episode_count < 5:
                         logger.info(f"  step={step} probs={dist.probs.detach().cpu().numpy()}")
                     action = dist.probs.argmax(dim=-1)             # greedy at eval
-
 
                 obs_dict, reward, done, info = env.step(action.item())
 

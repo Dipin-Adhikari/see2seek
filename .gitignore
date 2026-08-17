@@ -8,6 +8,7 @@ imagenav_dataset/
 test.py
 birds_eye_views
 data
+data_new
 tests
 wandb
 dataset

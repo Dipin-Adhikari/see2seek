@@ -43,7 +43,7 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "train"                    # "train" | "val" | "test"
+    # split: str = "train"                    # "train" | "val" | "test"
     # split: str = "val"
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
