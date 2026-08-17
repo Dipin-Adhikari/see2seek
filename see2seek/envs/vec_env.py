@@ -37,8 +37,9 @@ def _worker(
     cfg,
     conn: mp.connection.Connection,
     parent_conn: mp.connection.Connection,
-    shared_rgb: torch.Tensor,   # pre-shared (3, H, W) buffer for this worker
-    shared_goal: torch.Tensor,  # pre-shared (512,) buffer for this worker
+    shared_rgb: torch.Tensor,       # pre-shared (3, H, W) buffer for this worker
+    shared_goal: torch.Tensor,      # pre-shared (512,) buffer for this worker
+    shared_pointgoal: torch.Tensor, # pre-shared (3,) buffer for this worker
 ) -> None:
     parent_conn.close()
 
@@ -55,6 +56,7 @@ def _worker(
                 obs = env.reset()
                 shared_rgb.copy_(obs["rgb"])
                 shared_goal.copy_(obs["goal"])
+                shared_pointgoal.copy_(obs["pointgoal"])
                 conn.send("ok")
 
             elif cmd == "step":
@@ -64,6 +66,7 @@ def _worker(
                     obs = env.reset()
                 shared_rgb.copy_(obs["rgb"])
                 shared_goal.copy_(obs["goal"])
+                shared_pointgoal.copy_(obs["pointgoal"])
                 conn.send(("ok", reward, done, info))
 
             elif cmd == "close":
@@ -102,6 +105,7 @@ class VecEnv:
         self._processes: List[mp.Process] = []
         self._shared_rgb: List[torch.Tensor] = []
         self._shared_goal: List[torch.Tensor] = []
+        self._shared_pointgoal: List[torch.Tensor] = []
 
         ctx = mp.get_context("spawn")
 
@@ -110,17 +114,20 @@ class VecEnv:
         img_h = cfg.env.image_height      # 224
         img_w = cfg.env.image_width       # 224
         goal_dim = cfg.encoder.goal_embed_dim   # 512 (CLIP ViT-B/32)
+        pointgoal_dim = cfg.encoder.pointgoal_input_dim  # 3
 
         for i in range(self.num_envs):
             rgb_buf = torch.zeros(img_c, img_h, img_w, dtype=torch.float32)
             goal_buf = torch.zeros(goal_dim, dtype=torch.float32)
+            pointgoal_buf = torch.zeros(pointgoal_dim, dtype=torch.float32)
             rgb_buf.share_memory_()
             goal_buf.share_memory_()
+            pointgoal_buf.share_memory_()
 
             parent_conn, child_conn = ctx.Pipe()
             p = ctx.Process(
                 target=_worker,
-                args=(i, cfg, child_conn, parent_conn, rgb_buf, goal_buf),
+                args=(i, cfg, child_conn, parent_conn, rgb_buf, goal_buf, pointgoal_buf),
                 daemon=True,
             )
             p.start()
@@ -130,6 +137,7 @@ class VecEnv:
             self._processes.append(p)
             self._shared_rgb.append(rgb_buf)
             self._shared_goal.append(goal_buf)
+            self._shared_pointgoal.append(pointgoal_buf)
 
         logger.info(f"VecEnv: {self.num_envs} worker processes started (persistent shared buffers)")
 
@@ -188,6 +196,7 @@ class VecEnv:
         return {
             "rgb": torch.stack(self._shared_rgb, dim=0).clone(),
             "goal": torch.stack(self._shared_goal, dim=0).clone(),
+            "pointgoal": torch.stack(self._shared_pointgoal, dim=0).clone(),
         }
 
 

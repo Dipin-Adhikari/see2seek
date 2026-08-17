@@ -221,6 +221,8 @@ class GRUActorCritic(nn.Module):
         hidden_size: int = 512,
         num_actions: int = 4,
         num_action_embed: int = 32,
+        pointgoal_input_dim: int = 3,
+        pointgoal_embed_dim: int = 32,
         actor_hidden_dim: int = 256,
         critic_hidden_dim: int = 256,
     ) -> None:
@@ -231,6 +233,7 @@ class GRUActorCritic(nn.Module):
         self.use_cls = use_cls
         self.goal_embed_dim = goal_embed_dim
         self.num_action_embed = num_action_embed
+        self.pointgoal_embed_dim = pointgoal_embed_dim
 
         # ---- Spatial branch (trainable) ----
         self.spatial_head = SpatialCompressionHead(
@@ -247,12 +250,19 @@ class GRUActorCritic(nn.Module):
             embedding_dim=num_action_embed,
         )
 
+        # ---- PointGoal embedding ----
+        self.pointgoal_proj = nn.Sequential(
+            nn.Linear(pointgoal_input_dim, pointgoal_embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
         # ---- Fused input dim ----
         self.policy_input_dim = (
             self.spatial_head.output_dim
             + (cls_proj_dim if use_cls else 0)
             + goal_embed_dim
             + num_action_embed
+            + pointgoal_embed_dim
         )
 
         # ---- GRU ----
@@ -314,6 +324,11 @@ class GRUActorCritic(nn.Module):
                 nn.init.orthogonal_(m.weight)
                 nn.init.zeros_(m.bias)
 
+        for m in self.pointgoal_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
     # ------------------------------------------------------------------
     # Fusion helper
     # ------------------------------------------------------------------
@@ -324,6 +339,7 @@ class GRUActorCritic(nn.Module):
         cls_embed: torch.Tensor,
         goal_embed: torch.Tensor,
         prev_actions: torch.Tensor,
+        pointgoal: torch.Tensor,
     ) -> torch.Tensor:
         """
         Build the flat fused input vector for a batch of timesteps.
@@ -333,26 +349,23 @@ class GRUActorCritic(nn.Module):
             cls_embed:    (B, 768)      — DINOv2 CLS token.
             goal_embed:   (B, 512)      — CLIP goal embedding (raw, unprojected).
             prev_actions: (B,) long     — index of the action taken last step.
+            pointgoal:    (B, 3)        — [geodesic_dist, cos(angle), sin(angle)].
 
         Returns:
             (B, policy_input_dim)
         """
         spatial_feat = self.spatial_head(patch_embeds)          # (B, 1568), unit L2 norm
         prev_act_embed = self.prev_action_embed(prev_actions)   # (B, 32)
+        pointgoal_feat = self.pointgoal_proj(pointgoal)         # (B, 32)
 
         parts = [spatial_feat]
         if self.use_cls:
             cls_feat = self.cls_proj(cls_embed)                  # (B, 64)
-            # Same scale-parity fix as the spatial branch: LinearNormAct's
-            # internal LayerNorm gives unit per-element variance (L2 norm
-            # ~sqrt(64)=8), then ELU distorts that further (observed ~6.7 in
-            # branch_norms() logging) — neither matches goal's exact unit
-            # L2 norm. Explicit L2 normalize here is exact regardless of
-            # what the ELU does to the distribution.
             cls_feat = F.normalize(cls_feat, p=2, dim=-1)
             parts.append(cls_feat)                               # (B, 64), unit L2 norm
         parts.append(goal_embed)                                # (B, 512), raw, unit L2 norm
         parts.append(prev_act_embed)                             # (B, 32)
+        parts.append(pointgoal_feat)                             # (B, 32)
 
         return torch.cat(parts, dim=-1)
 
@@ -368,6 +381,7 @@ class GRUActorCritic(nn.Module):
         prev_actions: torch.Tensor,
         hidden: torch.Tensor,
         masks: torch.Tensor,
+        pointgoal: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Full forward pass through the spatial-compression head, CLS
@@ -382,6 +396,7 @@ class GRUActorCritic(nn.Module):
             hidden:       (1, N, hidden_size) — GRU hidden state.
             masks:        (N, 1) float — 0.0 at episode boundaries (resets h),
                           1.0 otherwise.
+            pointgoal:    (N, 3)        — [geodesic_dist, cos(angle), sin(angle)].
 
         Returns:
             logits:     (N, num_actions) — raw action scores (pre-softmax).
@@ -393,7 +408,7 @@ class GRUActorCritic(nn.Module):
         chunk_len  = total_B // num_chunks   # 1 during rollout, >1 during PPO update
 
         # 1. Fuse all branches: (total_B, policy_input_dim)
-        x = self._fuse_inputs(patch_embeds, cls_embed, goal_embed, prev_actions)
+        x = self._fuse_inputs(patch_embeds, cls_embed, goal_embed, prev_actions, pointgoal)
 
         # 2. Reshape to time-major: (chunk_len, num_chunks, features)
         x = x.view(chunk_len, num_chunks, -1)
@@ -429,10 +444,11 @@ class GRUActorCritic(nn.Module):
         prev_actions: torch.Tensor,
         hidden: torch.Tensor,
         masks: torch.Tensor,
+        pointgoal: torch.Tensor = None,
         can_stop: Optional[torch.Tensor] = None,   # (N,) bool, True = Stop allowed
     ) -> Tuple[Categorical, torch.Tensor, torch.Tensor]:
         logits, value, hidden_out = self.forward(
-            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks
+            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks, pointgoal
         )
         if can_stop is not None:
             stop_idx = self.num_actions - 1   # Stop is action index 3 (last)
@@ -450,10 +466,11 @@ class GRUActorCritic(nn.Module):
         hidden: torch.Tensor,
         masks: torch.Tensor,
         actions: torch.Tensor,
+        pointgoal: torch.Tensor = None,
         can_stop: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, value, _ = self.forward(
-            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks
+            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks, pointgoal
         )
         if can_stop is not None:
             stop_idx = self.num_actions - 1
@@ -539,6 +556,8 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
         hidden_size=cfg.policy.hidden_size,
         num_actions=cfg.env.num_actions,
         num_action_embed=getattr(enc, "action_embed_dim", 32),
+        pointgoal_input_dim=getattr(enc, "pointgoal_input_dim", 3),
+        pointgoal_embed_dim=getattr(enc, "pointgoal_embed_dim", 32),
         actor_hidden_dim=cfg.policy.actor_hidden_dim,
         critic_hidden_dim=cfg.policy.critic_hidden_dim,
     )

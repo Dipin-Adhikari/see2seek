@@ -127,15 +127,21 @@ class EncoderConfig:
     # --- Previous-action embedding ---
     action_embed_dim: int = 32             # dim of learned prev-action embedding
 
+    # --- PointGoal sensor embedding ---
+    pointgoal_input_dim: int = 3           # [geodesic_dist, cos(angle), sin(angle)]
+    pointgoal_embed_dim: int = 32          # projected dim of pointgoal sensor
+
     # --- Combined policy input ---
     # policy_input_dim = spatial_compressed_dim
     #                   + (cls_proj_dim if use_cls else 0)
     #                   + goal_embed_dim
     #                   + action_embed_dim
+    #                   + pointgoal_embed_dim
     @property
     def policy_input_dim(self) -> int:
         cls_dim = self.cls_proj_dim if self.use_cls else 0
-        return self.spatial_compressed_dim + cls_dim + self.goal_embed_dim + self.action_embed_dim
+        return (self.spatial_compressed_dim + cls_dim + self.goal_embed_dim
+                + self.action_embed_dim + self.pointgoal_embed_dim)
 
 
 # ---------------------------------------------------------------------------

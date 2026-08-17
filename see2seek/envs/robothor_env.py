@@ -415,8 +415,9 @@ class RoboTHOREnv:
             # 4. Fetch the environment state observations
             rgb = self._get_rgb_tensor(event.frame)
             goal_embedding = self._load_goal_embedding(ep)
+            pointgoal = self._compute_pointgoal()
 
-            return {"rgb": rgb, "goal": goal_embedding}
+            return {"rgb": rgb, "goal": goal_embedding, "pointgoal": pointgoal}
 
         # Exhausted all retries — this indicates a systemic problem
         # (e.g. bad dataset path, corrupted episode file) rather than a
@@ -455,6 +456,7 @@ class RoboTHOREnv:
                 obs = {
                     "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
                     "goal": self._get_cached_goal(),
+                    "pointgoal": self._compute_pointgoal(),
                 }
                 return obs, reward, done, info
 
@@ -503,7 +505,11 @@ class RoboTHOREnv:
         done = self._num_steps >= self.cfg.env.max_steps
         info = self._build_info(success=False, done=done)
 
-        obs = {"rgb": self._get_rgb_tensor(event.frame), "goal": self._get_cached_goal()}
+        obs = {
+            "rgb": self._get_rgb_tensor(event.frame),
+            "goal": self._get_cached_goal(),
+            "pointgoal": self._compute_pointgoal(),
+        }
         return obs, reward, done, info
 
     def _recover_from_controller_crash(
@@ -578,6 +584,37 @@ class RoboTHOREnv:
         ])
         success = dist <= self.cfg.env.success_distance
         return True, success
+
+    def _compute_pointgoal(self) -> torch.Tensor:
+        """
+        Compute the PointGoal sensor: [geodesic_distance, cos(angle), sin(angle)].
+
+        angle is the relative bearing from the agent's current facing direction
+        to the straight-line direction toward the goal (in radians).
+        """
+        agent_meta = self._controller.last_event.metadata["agent"]
+        agent_pos = agent_meta["position"]
+        agent_rot_y = agent_meta["rotation"]["y"]
+        goal_pos = self._current_episode["shortest_path"][-1]
+
+        dx = goal_pos["x"] - agent_pos["x"]
+        dz = goal_pos["z"] - agent_pos["z"]
+        goal_angle_deg = np.degrees(np.arctan2(dx, dz)) % 360
+        facing_deg = agent_rot_y % 360
+
+        relative_angle_deg = goal_angle_deg - facing_deg
+        if relative_angle_deg > 180:
+            relative_angle_deg -= 360
+        elif relative_angle_deg < -180:
+            relative_angle_deg += 360
+
+        relative_angle_rad = np.radians(relative_angle_deg)
+
+        return torch.tensor([
+            self._prev_geodesic_dist,
+            np.cos(relative_angle_rad),
+            np.sin(relative_angle_rad),
+        ], dtype=torch.float32)
 
 
 

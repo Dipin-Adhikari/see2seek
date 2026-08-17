@@ -104,6 +104,7 @@ class PPOTrainer:
             hidden_size=cfg.policy.hidden_size,
             num_actions=cfg.env.num_actions,
             device=self.device,
+            pointgoal_dim=cfg.encoder.pointgoal_input_dim,
             storage_device=getattr(cfg.ppo, "buffer_storage_device", None),
             store_dtype=getattr(cfg.ppo, "buffer_store_dtype", torch.float16),
         )
@@ -205,10 +206,13 @@ class PPOTrainer:
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
 
-                    # 1c. Policy forward
+                    # 1c. PointGoal sensor
+                    pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
+
+                    # 1d. Policy forward
                     dist, value, hidden_next = self.policy.act(
                         patch_embed, cls_embed, goal_embed, prev_actions,
-                        hidden, masks, can_stop=can_stop,
+                        hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
@@ -252,6 +256,7 @@ class PPOTrainer:
                     log_prob    = log_probs,
                     hidden      = hidden,
                     can_stop    = can_stop,
+                    pointgoal   = pointgoal,
                 )
 
                 # 1g. Update recurrent state
@@ -269,8 +274,10 @@ class PPOTrainer:
                 rgb = obs_dict["rgb"].to(self.device)
                 cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
                 goal_embed = self._get_goal_embeddings(obs_dict)
+                pointgoal = obs_dict["pointgoal"].to(self.device)
                 _, last_value, _ = self.policy.act(
-                    patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks
+                    patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks,
+                    pointgoal=pointgoal,
                 )
 
                 # ---- Branch-norm diagnostic (gated to avoid log spam) ----
@@ -342,6 +349,7 @@ class PPOTrainer:
                     hidden       = batch.hidden_states,
                     masks        = batch.masks,
                     actions      = batch.actions,
+                    pointgoal    = batch.pointgoals,
                     can_stop     = batch.can_stop,
                 )
 

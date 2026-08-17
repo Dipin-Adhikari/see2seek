@@ -86,6 +86,7 @@ class RecurrentBatch(NamedTuple):
     returns:        torch.Tensor    # (chunk_len * num_chunks,)
     advantages:     torch.Tensor    # (chunk_len * num_chunks,)
     can_stop:       torch.Tensor    # (chunk_len * num_chunks,)
+    pointgoals:     torch.Tensor    # (chunk_len * num_chunks, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +131,7 @@ class RolloutBuffer:
         hidden_size: int,
         num_actions: int,
         device: torch.device,
+        pointgoal_dim: int = 3,
         storage_device: Optional[torch.device] = None,
         store_dtype: torch.dtype = torch.float16,
     ) -> None:
@@ -142,6 +144,7 @@ class RolloutBuffer:
         self.hidden_size = hidden_size
         self.num_actions = num_actions
         self.device = device
+        self.pointgoal_dim = pointgoal_dim
         self.storage_device = storage_device if storage_device is not None else device
         self.store_dtype = store_dtype
 
@@ -167,6 +170,9 @@ class RolloutBuffer:
         self.patch_embeds = torch.zeros(T, N, P, D_patch, device=sd, dtype=sdt)
         self.cls_embeds   = torch.zeros(T, N, D_cls,       device=sd, dtype=sdt)
         self.goal_embeds  = torch.zeros(T, N, D_goal,       device=sd, dtype=sdt)
+
+        # PointGoal sensor (small — always on compute device, fp32)
+        self.pointgoals = torch.zeros(T, N, self.pointgoal_dim, device=self.device)
 
         # Actions
         self.actions      = torch.zeros(T, N, dtype=torch.long, device=self.device)
@@ -208,6 +214,7 @@ class RolloutBuffer:
         log_prob:     torch.Tensor,
         hidden:       torch.Tensor,
         can_stop:     torch.Tensor,
+        pointgoal:    torch.Tensor = None,
     ) -> None:
         """
         Insert one time-step of data from all environments.
@@ -224,6 +231,7 @@ class RolloutBuffer:
             log_prob:    (N,)
             hidden:      (1, N, hidden_size) — hidden state BEFORE this step
             can_stop:    (N,) bool
+            pointgoal:   (N, 3) — [geodesic_dist, cos(angle), sin(angle)]
         """
         t = self._step
 
@@ -244,6 +252,8 @@ class RolloutBuffer:
         self.log_probs[t]        = log_prob.detach()
         self.hidden_states[t+1]  = hidden.detach()   # hidden AFTER this step
         self.can_stop[t]         = can_stop
+        if pointgoal is not None:
+            self.pointgoals[t] = pointgoal.detach().to(device=self.device)
 
         self._step += 1
 
@@ -377,6 +387,7 @@ class RolloutBuffer:
         patch_list, cls_list, goal_list, prev_act_list, mask_list = [], [], [], [], []
         act_list, lp_list, ret_list, adv_list = [], [], [], []
         can_stop_list = []
+        pointgoal_list = []
 
         for local_t in range(chunk_len):
             t_idx_storage = (start_steps_storage + local_t).clamp(max=self.num_steps - 1)
@@ -393,6 +404,7 @@ class RolloutBuffer:
             ret_list.append(self.returns[t_idx, env_ids])
             adv_list.append(self.advantages[t_idx, env_ids])
             can_stop_list.append(self.can_stop[t_idx, env_ids])
+            pointgoal_list.append(self.pointgoals[t_idx, env_ids])
 
         # Stack along time dimension: (chunk_len, num_chunks, ...) → flatten time
         def _flat(lst):
@@ -424,6 +436,7 @@ class RolloutBuffer:
             returns       = _flat(ret_list),
             advantages    = _flat(adv_list),
             can_stop      = _flat(can_stop_list),
+            pointgoals    = _flat(pointgoal_list),
         )
 
     # ------------------------------------------------------------------
