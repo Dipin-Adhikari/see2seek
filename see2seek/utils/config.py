@@ -70,17 +70,17 @@ class EnvConfig:
     rotate_degrees: float = 30.0           # degrees per RotateLeft/Right
 
     # --- Reward shaping ---
-    success_reward: float = 4
-    slack_reward: float = -0.01            # small penalty per step
-    geodesic_reward_scale: float = 1.0    # scale on geodesic-distance delta
+    success_reward: float = 2.5
+    failed_stop_penalty: float = -0.2     # penalty for calling Stop when not at goal
+    slack_reward: float = -0.005           # small penalty per step
+    geodesic_reward_scale: float = 2.0    # scale on geodesic-distance delta
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
     collision_penalty: float = -0.01
-    rotation_penalty: float = -0.015           # small penalty for each rotation step
-
+    angle_to_goal_scale: float = 0.005    # reward per degree of rotation toward goal
 
     # --- Episode limits ---
     max_steps: int = 500
-    min_steps_before_stop: int = 5                 # don't allow Stop until this many steps
+    min_steps_before_stop: int = 20                # don't allow Stop until this many steps
 
     # --- Parallelism ---
     num_envs: int = 16                    # number of parallel rollout workers

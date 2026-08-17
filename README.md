@@ -143,18 +143,19 @@ where Δgeodesic_distance is the decrease (negative if moving away) in shortest-
 
 Defaults (see `see2seek/utils/config.py`):
 
-- `success_reward`: 4.0
-- `slack_reward`: -0.01 (small step penalty)
-- `geodesic_reward_scale`: 1.0 (multiplies the geodesic-distance delta)
+- `success_reward`: 2.5
+- `failed_stop_penalty`: -0.2 (penalty for calling Stop when not at goal)
+- `slack_reward`: -0.005 (small step penalty)
+- `geodesic_reward_scale`: 2.0 (multiplies the geodesic-distance delta)
 - `success_distance`: 1.0 metre
 - `collision_penalty`: -0.01 (penalty applied on collision events)
-- `rotation_penalty`: -0.015 (small penalty per rotation step)
+- `angle_to_goal_scale`: 0.005 (reward per degree of rotation toward the goal)
 - `max_steps`: 500 (episode horizon)
-- `min_steps_before_stop`: 5 (disallow `Stop` before this many steps)
+- `min_steps_before_stop`: 20 (disallow `Stop` before this many steps)
 
 Notes:
 
-- If `Stop` is called but the agent is not within `success_distance`, the terminal reward for that action is 0 (no success bonus).
+- If `Stop` is called but the agent is not within `success_distance`, the agent receives `failed_stop_penalty` (-0.2).
 - Geodesic distances and shortest paths are computed using the AI2-THOR utilities (`get_shortest_path_to_point`, `path_distance`) in the environment wrapper.
 - The shaping encourages motion that reduces true navigable distance to the goal rather than only visual similarity.
 
