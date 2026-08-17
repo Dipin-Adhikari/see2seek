@@ -76,7 +76,7 @@ class EnvConfig:
     geodesic_reward_scale: float = 2.0    # scale on geodesic-distance delta
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
     collision_penalty: float = -0.01
-    angle_to_goal_scale: float = 0.005    # reward per degree of rotation toward goal
+    rotation_penalty: float = -0.01       # fixed cost per rotation to prevent spinning
 
     # --- Episode limits ---
     max_steps: int = 500

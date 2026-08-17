@@ -149,7 +149,7 @@ Defaults (see `see2seek/utils/config.py`):
 - `geodesic_reward_scale`: 2.0 (multiplies the geodesic-distance delta)
 - `success_distance`: 1.0 metre
 - `collision_penalty`: -0.01 (penalty applied on collision events)
-- `angle_to_goal_scale`: 0.005 (reward per degree of rotation toward the goal)
+- `rotation_penalty`: -0.01 (fixed cost per rotation to prevent spinning in place)
 - `max_steps`: 500 (episode horizon)
 - `min_steps_before_stop`: 20 (disallow `Stop` before this many steps)
 

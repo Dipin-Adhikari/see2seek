@@ -412,12 +412,6 @@ class RoboTHOREnv:
             self._path_length = 0.0
             self._last_agent_pos = dict(ep["initial_position"])
 
-            # 3c. Angle-to-goal tracking for rotation shaping
-            agent_rot_y = ep.get("initial_orientation", 0.0)
-            self._prev_angle_to_goal = self._angle_to_goal(
-                ep["initial_position"], agent_rot_y, goal_pos
-            )
-
             # 4. Fetch the environment state observations
             rgb = self._get_rgb_tensor(event.frame)
             goal_embedding = self._load_goal_embedding(ep)
@@ -498,15 +492,11 @@ class RoboTHOREnv:
         reward += self.cfg.env.slack_reward
 
         if action_name == "MoveAhead":
-            # Update angle-to-goal after position change
-            agent_pos_now = event.metadata["agent"]["position"]
-            agent_rot_y = event.metadata["agent"]["rotation"]["y"]
-            self._prev_angle_to_goal = self._angle_to_goal(agent_pos_now, agent_rot_y, goal_pos)
             if event.metadata.get("collided", False):
                 reward += self.cfg.env.collision_penalty
                 self._episode_collisions += 1
         elif action_name in {"RotateLeft", "RotateRight"}:
-            reward += self._angle_to_goal_reward(event, goal_pos)
+            reward += self.cfg.env.rotation_penalty
 
         self._prev_geodesic_dist = curr_dist
 
@@ -589,33 +579,6 @@ class RoboTHOREnv:
         success = dist <= self.cfg.env.success_distance
         return True, success
 
-    def _angle_to_goal(self, agent_pos: Dict, agent_rotation_y: float, goal_pos: Dict) -> float:
-        """
-        Compute the absolute angle (degrees) between the agent's facing
-        direction and the direction to the goal. Returns value in [0, 180].
-        """
-        dx = goal_pos["x"] - agent_pos["x"]
-        dz = goal_pos["z"] - agent_pos["z"]
-        goal_angle = np.degrees(np.arctan2(dx, dz)) % 360
-        facing = agent_rotation_y % 360
-        diff = abs(goal_angle - facing)
-        if diff > 180:
-            diff = 360 - diff
-        return diff
-
-    def _angle_to_goal_reward(self, event, goal_pos: Dict) -> float:
-        """
-        Reward for rotating toward the goal, penalty for rotating away.
-        Returns: angle_to_goal_scale * (angle_before - angle_after).
-        Positive when the agent turned to face the goal.
-        """
-        agent_pos = event.metadata["agent"]["position"]
-        agent_rot_y = event.metadata["agent"]["rotation"]["y"]
-        angle_after = self._angle_to_goal(agent_pos, agent_rot_y, goal_pos)
-        angle_before = self._prev_angle_to_goal
-        self._prev_angle_to_goal = angle_after
-        delta = angle_before - angle_after
-        return self.cfg.env.angle_to_goal_scale * delta
 
 
     def _get_geodesic_distance(self, goal_pos: Dict) -> float:
