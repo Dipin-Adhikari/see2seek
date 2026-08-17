@@ -1,162 +1,207 @@
 # See2Seek
 
-See2Seek is a zero-shot embodied navigation in the RoboTHOR simulator. The project uses a frozen DINOv2 visual encoder for observations and a CLIP text encoder for goal specification, then trains a recurrent PPO policy to navigate toward image or language goals without task-specific supervision.
-
-The core idea follows the ZSON-style zero-shot transfer recipe:
-
-- Observation encoder: DINOv2 ViT-B/14
-- Goal encoder: CLIP ViT-B/32
-- Policy: GRU-based actor-critic with PPO
-- Environment: AI2-THOR / RoboTHOR
-- Evaluation metrics: Success Rate (SR) and Success weighted by Path Length (SPL)
-
-This repo is tailored to research experiments around whether stronger spatial visual representations from DINOv2 improve downstream visual-language navigation behavior.
-
-## What this project does
-
-See2Seek supports both:
-
-- Image-goal navigation (ImageNav)
-- Zero-shot object navigation (ObjectNav) from text prompts in English 
-
-The codebase is organized around:
-
-- `see2seek/envs/` for the RoboTHOR simulator interface
-- `see2seek/models/encoders/` for DINOv2 and CLIP encoding logic
-- `see2seek/agents/` for the recurrent navigation policy
-- `see2seek/trainers/` for PPO training
-- `see2seek/evaluation/` for SR / SPL evaluation
-
-## Repository layout
-
-- `scripts/train.py` — training entry point
-- `scripts/eval.py` — evaluation entry point
-- `configs/` — configuration files and YAML overrides
-- `data/checkpoints/` — saved model checkpoints
-- `dataset/` — episode datasets
-
-## Environment and dependencies
-
-The project expects a Python environment with PyTorch, AI2-THOR, OpenCLIP, and supporting scientific dependencies.
-
-A convenient path is the workspace virtual environment:
-
-```bash
-cd /home/dipin/See2Seek
-./minorenv/bin/python -m pip install -r requirements.txt
-./minorenv/bin/python -m pip install -e .
-```
-
-If you are using a different interpreter, the install should still be equivalent to:
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-## Quick start
-
-### 1. Train a model
-
-A debugging smoke test is the easiest way to validate that the training stack is wired correctly:
-
-```bash
-cd /home/dipin/See2Seek
-./minorenv/bin/python scripts/train.py --debug
-```
-
-A full training run can be launched with the default config or a YAML override:
-
-```bash
-./minorenv/bin/python scripts/train.py --config configs/train_robothor.yaml
-```
-
-To resume from a checkpoint:
-
-```bash
-./minorenv/bin/python scripts/train.py --config configs/train_robothor.yaml --resume data/checkpoints/checkpoint_000500000.pth
-```
-
-### 2. Evaluate a checkpoint
-
-Evaluate on the validation split for ImageNav:
-
-```bash
-./minorenv/bin/python scripts/eval.py --checkpoint data/checkpoints/checkpoint_final.pth --task imagenav
-```
-
-Evaluate zero-shot ObjectNav in English:
-
-```bash
-./minorenv/bin/python scripts/eval.py --checkpoint data/checkpoints/checkpoint_final.pth --task objectnav --language en
-```
-
-
-## Configuration
-
-The main runtime defaults live in `see2seek/utils/config.py`. This includes:
-
-- environment and action-space settings
-- DINOv2/CLIP encoder configuration
-- PPO hyperparameters
-- checkpoint, log, and cache paths
-- device selection and random seed
-
-You can override settings with a YAML file. The repo already includes `configs/train_robothor.yaml`, which is intended to hold experiment-specific overrides.
-
-## Notes about datasets and artifacts
-
-The project expects:
-
-- RoboTHOR episode splits under the `dataset/` folder
-- checkpoints in `data/checkpoints/`
-- training logs under `data/logs/` or `logs/`
-
+Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders with a recurrent PPO policy. The agent navigates toward image goals (ImageNav) and transfers zero-shot to object goals via language (ObjectNav).
 
 ## Architecture
 
-High-level model architecture used by See2Seek:
+```
+                         +-----------+
+                         | RGB Frame |
+                         | (224x224) |
+                         +-----+-----+
+                               |
+                    +----------+----------+
+                    |                     |
+            +-------v-------+    +-------v-------+
+            |   DINOv2      |    |   DINOv2      |
+            |  ViT-B/14     |    |  ViT-B/14     |
+            |  (frozen)     |    |  (frozen)     |
+            +-------+-------+    +-------+-------+
+                    |                     |
+            +-------v-------+    +-------v-------+
+            | Patch Tokens  |    |  CLS Token    |
+            | (256 x 768)   |    |    (768)      |
+            +-------+-------+    +-------+-------+
+                    |                     |
+            +-------v-------+    +-------v-------+
+            | Spatial CNN   |    | Linear+LN+ELU |
+            | (trainable)   |    |  (trainable)  |
+            | k3s2 -> k3s1  |    +-------+-------+
+            +-------+-------+            |
+                    |                     |
+            +-------v-------+    +-------v-------+
+            | L2 Normalize  |    | L2 Normalize  |
+            |   (1568-d)    |    |    (64-d)     |
+            +-------+-------+    +-------+-------+
+                    |                     |
+                    +----------+----------+
+                               |
+   +-------------+    +--------v--------+    +--------------+    +---------------+
+   | Goal Image  |    |                 |    | Prev Action  |    | PointGoal     |
+   | CLIP ViT-B  |    |   Concatenate   |    | Embedding    |    | GPS+Compass   |
+   | (frozen)    |--->|                 |<---|   (32-d)     |    | Linear+ReLU   |
+   |  (512-d)    |    |   (2208-d)      |    +--------------+    |   (32-d)      |
+   +-------------+    +--------+--------+                        +-------+-------+
+                               |                                         |
+                               +-----------------------------------------+
+                               |
+                       +-------v-------+
+                       |    GRU        |
+                       | (512 hidden)  |
+                       | 1-layer       |
+                       +---+-------+---+
+                           |       |
+                   +-------v--+ +--v-------+
+                   |  Actor   | |  Critic  |
+                   | Lin+ELU  | | Lin+ELU  |
+                   |  -> 4    | |  -> 1    |
+                   +----------+ +----------+
+                       |              |
+                  Action Dist     Value V(s)
+```
 
-- Observation encoder: frozen DINOv2 ViT-B/14. Produces a CLS token (`(B,768)`) and a flat grid of patch tokens (`(B,256,768)`) corresponding to a 16x16 patch grid over a 224x224 input.
-- Goal encoder: frozen CLIP ViT-B/32. Produces a 512-dim goal embedding (fed raw into the policy).
-- SpatialCompressionHead (trainable): a 2-layer CNN that compresses DINOv2 patch tokens into a spatial feature map (32 x 7 x 7) and flattens to a 1568-dim vector. Conv sequence: Conv2d(768→128, k=3, s=2) -> (B,128,7,7), Conv2d(128→32, k=3, s=1, p=1) -> (B,32,7,7) → flatten (32*7*7 = 1568).
-- CLS projection (trainable, ablatable): small Linear→LayerNorm→ELU projection of the DINOv2 CLS token to 64 dims (enabled by default via `use_cls`).
-- Previous-action embedding (trainable): learned embedding of the last discrete action (default 32-dim).
+### Branch Dimensions
 
-Fusion and recurrent policy:
+| Branch | Source | Trainable | Output Dim |
+|--------|--------|-----------|------------|
+| Spatial | DINOv2 patches (256x768) -> 2-layer CNN | Yes | 1568 |
+| CLS | DINOv2 CLS token (768) -> projection | Yes | 64 |
+| Goal | CLIP ViT-B/32 image/text embedding | No (frozen) | 512 |
+| Prev Action | Learned embedding of last action | Yes | 32 |
+| PointGoal | [geodesic_dist, cos(angle), sin(angle)] -> Linear+ReLU | Yes | 32 |
+| **Total** | | | **2208** |
 
-- The policy concatenates: spatial compressed vector (1568) + CLS projection (64, if enabled) + goal raw embedding (512) + prev-action embedding (32). With `use_cls=True` this yields a 2176-dim policy input (1568 + 64 + 512 + 32). If `use_cls=False`, the input is 2112-dim.
-- Recurrent core: single-layer GRU (hidden size 512 by default). Actor and critic heads are small MLPs (default intermediate dims 256).
+### PointGoal Sensor (GPS+Compass)
 
-Design notes:
+```
+  Agent Position + Rotation (from simulator)
+  Goal Position (from episode metadata)
+            |
+            v
+  +----------------------------+
+  | Compute:                   |
+  |  - Geodesic distance       |
+  |  - Relative angle to goal  |
+  +----------------------------+
+            |
+            v
+  [ geodesic_dist, cos(angle), sin(angle) ]   -->  Linear(3, 32) + ReLU  -->  (32-d)
+```
 
-- The DINOv2 and CLIP backbones are frozen (no gradients). The SpatialCompressionHead and CLS projection are trainable; therefore the training pipeline re-runs the compression/projection inside policy evaluation so gradients flow correctly. The rollout buffer stores raw DINOv2 outputs (patch tokens and CLS tokens) rather than pre-compressed vectors.
-- The fusion is a flat concatenation (single fusion point) following the ZSON/EmbCLIP-inspired design adopted in this project.
+Used during **ImageNav training/eval** (goal location known). For **zero-shot ObjectNav** testing, zeroed out — the GRU retains learned navigation behaviors (obstacle avoidance, path following) from training.
 
-## Reward function
+## Reward Function
 
-The environment uses geodesic-distance-based dense shaping with a terminal success bonus. In formula form, each intermediate step reward is:
+```
+  +--------------------------------------------------+
+  |               Per-Step Reward                     |
+  +--------------------------------------------------+
+  |                                                  |
+  |  r_t = geodesic_scale * delta_geodesic           |
+  |       + slack_reward                             |
+  |       + (collision_penalty if collided)           |
+  |       + (rotation_penalty if rotated)             |
+  |                                                  |
+  +--------------------------------------------------+
 
- r_t = geodesic_reward_scale * Δgeodesic_distance + slack_reward
+  +--------------------------------------------------+
+  |             Terminal: Stop Action                  |
+  +--------------------------------------------------+
+  |                                                  |
+  |  if distance_to_goal < 1.0m:                     |
+  |      reward = +2.5  (success!)                   |
+  |  else:                                           |
+  |      reward = -0.2  (failed stop penalty)        |
+  |                                                  |
+  +--------------------------------------------------+
+```
 
-where Δgeodesic_distance is the decrease (negative if moving away) in shortest-path distance to the goal between consecutive timesteps. On calling `Stop` when the agent is within `success_distance` metres of the goal, the agent receives `success_reward` and the episode terminates.
+### Reward Parameters
 
-Defaults (see `see2seek/utils/config.py`):
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `geodesic_reward_scale` | 2.0 | Reward for reducing shortest-path distance to goal |
+| `slack_reward` | -0.005 | Small step penalty (encourages efficiency) |
+| `collision_penalty` | -0.01 | Discourages walking into walls |
+| `rotation_penalty` | -0.01 | Fixed cost per rotation (prevents spinning) |
+| `success_reward` | +2.5 | Bonus for stopping within 1m of goal |
+| `failed_stop_penalty` | -0.2 | Penalty for stopping too far from goal |
+| `min_steps_before_stop` | 20 | Stop action masked for first 20 steps |
 
-- `success_reward`: 2.5
-- `failed_stop_penalty`: -0.2 (penalty for calling Stop when not at goal)
-- `slack_reward`: -0.005 (small step penalty)
-- `geodesic_reward_scale`: 2.0 (multiplies the geodesic-distance delta)
-- `success_distance`: 1.0 metre
-- `collision_penalty`: -0.01 (penalty applied on collision events)
-- `rotation_penalty`: -0.01 (fixed cost per rotation to prevent spinning in place)
-- `max_steps`: 500 (episode horizon)
-- `min_steps_before_stop`: 20 (disallow `Stop` before this many steps)
+## Training
 
-Notes:
+```bash
+# Start training
+python scripts/train.py
 
-- If `Stop` is called but the agent is not within `success_distance`, the agent receives `failed_stop_penalty` (-0.2).
-- Geodesic distances and shortest paths are computed using the AI2-THOR utilities (`get_shortest_path_to_point`, `path_distance`) in the environment wrapper.
-- The shaping encourages motion that reduces true navigable distance to the goal rather than only visual similarity.
+# Resume from checkpoint
+python scripts/train.py --resume data_new/checkpoints/checkpoint_000000100352.pth
+```
 
+### Training Configuration
 
+- **Environments:** 16 parallel RoboTHOR workers (shared-memory VecEnv)
+- **Rollout:** 128 steps/env = 2048 steps per PPO update
+- **PPO:** 4 epochs, 2 mini-batches, clip=0.2, entropy_coef=0.03
+- **Optimizer:** Adam, lr=2.5e-4
+- **Total steps:** 10M
+
+## Evaluation
+
+```bash
+# ImageNav evaluation
+python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task imagenav
+
+# Zero-shot ObjectNav (text goal)
+python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task objectnav
+```
+
+### Metrics
+
+- **SR (Success Rate):** Fraction of episodes where agent stops within 1m of goal
+- **SPL (Success weighted by Path Length):** SR penalized by path inefficiency
+
+## Project Structure
+
+```
+See2Seek/
+├── scripts/
+│   ├── train.py              # Training entry point
+│   └── eval.py               # Evaluation entry point
+├── see2seek/
+│   ├── agents/
+│   │   └── gru_policy.py     # GRU Actor-Critic + SpatialCompressionHead
+│   ├── buffers/
+│   │   └── rollout_buffer.py # Recurrent PPO rollout storage
+│   ├── envs/
+│   │   ├── robothor_env.py   # RoboTHOR gym wrapper + reward logic
+│   │   └── vec_env.py        # Shared-memory vectorized environments
+│   ├── models/encoders/
+│   │   ├── dino_encoder.py   # Frozen DINOv2 ViT-B/14
+│   │   └── clip_encoder.py   # Frozen CLIP ViT-B/32
+│   ├── trainers/
+│   │   └── ppo_trainer.py    # PPO training loop
+│   └── utils/
+│       └── config.py         # Central configuration
+├── configs/
+│   └── train_robothor.yaml   # YAML config overrides
+└── data_new/
+    ├── checkpoints/          # Saved model weights
+    └── goal_datasets/        # Pre-cached CLIP goal embeddings
+```
+
+## Key Design Decisions
+
+1. **Frozen encoders, trainable fusion:** DINOv2 and CLIP never update — only the spatial CNN, CLS projection, PointGoal projection, and GRU train. This keeps compute low and leverages pretrained representations.
+
+2. **Raw token storage in buffer:** The rollout buffer stores raw DINOv2 outputs (not compressed features) so gradients flow through the trainable SpatialCompressionHead during PPO updates.
+
+3. **L2-normalized branches:** Spatial, CLS, and Goal branches are all L2-normalized to unit norm before concatenation, ensuring no branch dominates by magnitude alone.
+
+4. **PointGoal as training signal:** GPS+Compass sensor teaches the GRU *how to navigate* during ImageNav; learned behaviors transfer to ObjectNav at test time (where PointGoal is unavailable).
+
+## References
+
+- [ZSON: Zero-Shot Object-Goal Navigation](https://arxiv.org/abs/2206.12403)
+- [EmbCLIP: Simple but Effective CLIP Embeddings for Embodied AI](https://arxiv.org/abs/2111.09888)
+- [DINOv2: Learning Robust Visual Features](https://arxiv.org/abs/2304.07193)
