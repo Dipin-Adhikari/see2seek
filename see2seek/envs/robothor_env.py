@@ -494,7 +494,7 @@ class RoboTHOREnv:
         reward += self.cfg.env.slack_reward
 
         if action_name == "MoveAhead":
-            if event.metadata.get("collided", False):
+            if not event.metadata.get("lastActionSuccess", True):
                 reward += self.cfg.env.collision_penalty
                 self._episode_collisions += 1
         elif action_name in {"RotateLeft", "RotateRight"}:
