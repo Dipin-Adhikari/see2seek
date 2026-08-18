@@ -4,61 +4,7 @@ Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders wi
 
 ## Architecture
 
-```
-                         +-----------+
-                         | RGB Frame |
-                         | (224x224) |
-                         +-----+-----+
-                               |
-                    +----------+----------+
-                    |                     |
-            +-------v-------+    +-------v-------+
-            |   DINOv2      |    |   DINOv2      |
-            |  ViT-B/14     |    |  ViT-B/14     |
-            |  (frozen)     |    |  (frozen)     |
-            +-------+-------+    +-------+-------+
-                    |                     |
-            +-------v-------+    +-------v-------+
-            | Patch Tokens  |    |  CLS Token    |
-            | (256 x 768)   |    |    (768)      |
-            +-------+-------+    +-------+-------+
-                    |                     |
-            +-------v-------+    +-------v-------+
-            | Spatial CNN   |    | Linear+LN+ELU |
-            | (trainable)   |    |  (trainable)  |
-            | k3s2 -> k3s1  |    +-------+-------+
-            +-------+-------+            |
-                    |                     |
-            +-------v-------+    +-------v-------+
-            | L2 Normalize  |    | L2 Normalize  |
-            |   (1568-d)    |    |    (64-d)     |
-            +-------+-------+    +-------+-------+
-                    |                     |
-                    +----------+----------+
-                               |
-   +-------------+    +--------v--------+    +--------------+    +---------------+
-   | Goal Image  |    |                 |    | Prev Action  |    | PointGoal     |
-   | CLIP ViT-B  |    |   Concatenate   |    | Embedding    |    | GPS+Compass   |
-   | (frozen)    |--->|                 |<---|   (32-d)     |    | Linear+ReLU   |
-   |  (512-d)    |    |   (2208-d)      |    +--------------+    |   (32-d)      |
-   +-------------+    +--------+--------+                        +-------+-------+
-                               |                                         |
-                               +-----------------------------------------+
-                               |
-                       +-------v-------+
-                       |    GRU        |
-                       | (512 hidden)  |
-                       | 1-layer       |
-                       +---+-------+---+
-                           |       |
-                   +-------v--+ +--v-------+
-                   |  Actor   | |  Critic  |
-                   | Lin+ELU  | | Lin+ELU  |
-                   |  -> 4    | |  -> 1    |
-                   +----------+ +----------+
-                       |              |
-                  Action Dist     Value V(s)
-```
+![System Architecture](docs/system_architecture.png)
 
 ### Branch Dimensions
 
@@ -205,3 +151,5 @@ See2Seek/
 - [ZSON: Zero-Shot Object-Goal Navigation](https://arxiv.org/abs/2206.12403)
 - [EmbCLIP: Simple but Effective CLIP Embeddings for Embodied AI](https://arxiv.org/abs/2111.09888)
 - [DINOv2: Learning Robust Visual Features](https://arxiv.org/abs/2304.07193)
+- [CLIP: Learning Transferable Visual Models From Natural Language Supervision](https://arxiv.org/abs/2103.00020)
+- [RoboTHOR: An Open Simulation-to-Real Embodied AI Platform](https://arxiv.org/abs/2004.06799)

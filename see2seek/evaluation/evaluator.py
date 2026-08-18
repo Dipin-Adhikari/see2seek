@@ -147,9 +147,7 @@ class Evaluator:
                         patch_embed, cls_embed, goal_embed, prev_action,
                         hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
                     )
-                    if episode_count < 5:
-                        logger.info(f"  step={step} probs={dist.probs.detach().cpu().numpy()}")
-                    action = dist.probs.argmax(dim=-1)             # greedy at eval
+                    action = dist.sample()                         # stochastic eval
 
                 obs_dict, reward, done, info = env.step(action.item())
 
