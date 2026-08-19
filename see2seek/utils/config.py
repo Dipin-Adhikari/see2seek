@@ -43,20 +43,21 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    # split: str = "train"                    # "train" | "val" | "test"
-    split: str = "val"
+    split: str = "train"                    # "train" | "val" | "test"
+    # split: str = "val"
 
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
-    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
+    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+
+    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
+    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -133,6 +134,7 @@ class EncoderConfig:
     # --- PointGoal sensor embedding ---
     pointgoal_input_dim: int = 3           # [geodesic_dist, cos(angle), sin(angle)]
     pointgoal_embed_dim: int = 32          # projected dim of pointgoal sensor
+    pointgoal_dropout: float = 0.5         # probability of zeroing pointgoal (for ObjectNav transfer)
 
     # --- Combined policy input ---
     # policy_input_dim = spatial_compressed_dim

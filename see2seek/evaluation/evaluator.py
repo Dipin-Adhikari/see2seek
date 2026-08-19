@@ -139,7 +139,10 @@ class Evaluator:
                 rgb = obs_dict["rgb"].to(self.device)
                 cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
                 goal_embed = obs_dict["goal"].to(self.device)
-                pointgoal = obs_dict["pointgoal"].to(self.device)
+                if task == "objectnav":
+                    pointgoal = torch.zeros(self.num_envs, 3, device=self.device)
+                else:
+                    pointgoal = obs_dict["pointgoal"].to(self.device)
 
                 can_stop = steps_since_reset >= self.cfg.env.min_steps_before_stop
 

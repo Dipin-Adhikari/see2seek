@@ -27,6 +27,7 @@ def parse_args():
     p.add_argument("--split",      default="val",      choices=["val", "test"])
     p.add_argument("--num_episodes", type=int, default=None, help="Max episodes (None=all)")
     p.add_argument("--num_envs",   type=int, default=None, help="Parallel envs (default: from config)")
+    p.add_argument("--min_steps_before_stop", type=int, default=None, help="Override min steps before stop (default: from config)")
     p.add_argument("--log_file",   default=None, help="Path to save eval log (auto-generated if None)")
     p.add_argument("--device",     default=None)
     return p.parse_args()
@@ -45,6 +46,8 @@ def main():
 
     if args.device:
         cfg.device = args.device
+    if args.min_steps_before_stop is not None:
+        cfg.env.min_steps_before_stop = args.min_steps_before_stop
 
     from see2seek.evaluation.evaluator import Evaluator
     evaluator = Evaluator(

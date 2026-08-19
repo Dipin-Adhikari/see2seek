@@ -206,8 +206,12 @@ class PPOTrainer:
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
 
-                    # 1c. PointGoal sensor
+                    # 1c. PointGoal sensor (with dropout for zero-shot transfer)
                     pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
+                    if cfg.encoder.pointgoal_dropout > 0.0:
+                        drop_mask = (torch.rand(pointgoal.shape[0], 1, device=self.device)
+                                     > cfg.encoder.pointgoal_dropout).float()
+                        pointgoal = pointgoal * drop_mask
 
                     # 1d. Policy forward
                     dist, value, hidden_next = self.policy.act(
