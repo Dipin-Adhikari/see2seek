@@ -2,11 +2,17 @@
 
 Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders with a recurrent PPO policy. The agent navigates toward image goals (ImageNav) and transfers zero-shot to object goals via language (ObjectNav).
 
+We compare DINOv2's spatial patch features against CLIP's contrastive features as the observation encoder, demonstrating that DINOv2's self-supervised spatial representations are better suited for embodied navigation tasks.
+
 ## Architecture
 
 ![System Architecture](docs/system_architecture.png)
 
-### Branch Dimensions
+### Observation Encoder Comparison
+
+The system supports two observation encoder modes, switchable via `--obs_encoder dino/clip`:
+
+**DINOv2 (Ours)** — Preserves spatial structure through patch tokens:
 
 | Branch | Source | Trainable | Output Dim |
 |--------|--------|-----------|------------|
@@ -16,6 +22,16 @@ Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders wi
 | Prev Action | Learned embedding of last action | Yes | 32 |
 | PointGoal | [geodesic_dist, cos(angle), sin(angle)] -> Linear+ReLU | Yes | 32 |
 | **Total** | | | **2208** |
+
+**CLIP Baseline** — No spatial features (lost to contrastive training):
+
+| Branch | Source | Trainable | Output Dim |
+|--------|--------|-----------|------------|
+| Observation | CLIP ViT-B/32 CLS token (512) -> projection | Yes | 512 |
+| Goal | CLIP ViT-B/32 image/text embedding | No (frozen) | 512 |
+| Prev Action | Learned embedding of last action | Yes | 32 |
+| PointGoal | [geodesic_dist, cos(angle), sin(angle)] -> Linear+ReLU | Yes | 32 |
+| **Total** | | | **1088** |
 
 ### PointGoal Sensor (GPS+Compass)
 
@@ -77,8 +93,11 @@ Used during **ImageNav training/eval** (goal location known). For **zero-shot Ob
 ## Training
 
 ```bash
-# Start training
-python scripts/train.py
+# Train with DINOv2 obs encoder (default)
+python scripts/train.py --obs_encoder dino
+
+# Train with CLIP obs encoder (baseline)
+python scripts/train.py --obs_encoder clip
 
 # Resume from checkpoint
 python scripts/train.py --resume data_new/checkpoints/checkpoint_000000100352.pth
@@ -91,15 +110,22 @@ python scripts/train.py --resume data_new/checkpoints/checkpoint_000000100352.pt
 - **PPO:** 4 epochs, 2 mini-batches, clip=0.2, entropy_coef=0.03
 - **Optimizer:** Adam, lr=2.5e-4
 - **Total steps:** 10M
+- **PointGoal dropout:** 50% (for zero-shot ObjectNav transfer)
 
 ## Evaluation
 
 ```bash
-# ImageNav evaluation
+# ImageNav evaluation (with GPS)
 python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task imagenav
 
-# Zero-shot ObjectNav (text goal)
+# ImageNav evaluation (visual-only, no GPS)
+python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task imagenav --zero_pointgoal
+
+# Zero-shot ObjectNav (text goal, no GPS)
 python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task objectnav
+
+# Evaluate CLIP baseline model
+python scripts/eval.py --checkpoint data_new/checkpoints/clip_checkpoint.pth --obs_encoder clip --task imagenav
 ```
 
 ### Metrics
@@ -145,6 +171,8 @@ See2Seek/
 3. **L2-normalized branches:** Spatial, CLS, and Goal branches are all L2-normalized to unit norm before concatenation, ensuring no branch dominates by magnitude alone.
 
 4. **PointGoal as training signal:** GPS+Compass sensor teaches the GRU *how to navigate* during ImageNav; learned behaviors transfer to ObjectNav at test time (where PointGoal is unavailable).
+
+5. **Modular obs encoder for ablation:** DINOv2 vs CLIP observation encoder is switchable via a single flag, keeping goal encoder (CLIP) and all other components identical for a controlled comparison.
 
 ## References
 
