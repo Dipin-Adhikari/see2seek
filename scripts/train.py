@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="See to Seek — PPO Training")
     p.add_argument("--config", default=None, help="Path to YAML config file")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
+    p.add_argument("--obs_encoder", default=None, choices=["dino", "clip"],
+                   help="Observation encoder: dino (DINOv2 ViT-B/14) or clip (CLIP ViT-B/32 baseline)")
     p.add_argument("--debug",  action="store_true", help="Short smoke test (2 updates)")
     p.add_argument("--seed",   type=int, default=None, help="Override random seed")
     p.add_argument("--device", default=None, help="Override device (cuda/cpu)")
@@ -80,6 +82,8 @@ def main() -> None:
         logger.info("Using default config")
 
     # ---- Apply CLI overrides ----
+    if args.obs_encoder is not None:
+        cfg.encoder.obs_encoder_type = args.obs_encoder
     if args.seed is not None:
         cfg.seed = args.seed
     if args.device is not None:

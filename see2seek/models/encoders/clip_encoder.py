@@ -180,6 +180,37 @@ class CLIPGoalEncoder(nn.Module):
 
         return embeddings
 
+    @torch.no_grad()
+    def get_obs_embedding(self, rgb: torch.Tensor) -> torch.Tensor:
+        """
+        Encode raw RGB observation tensor into a 512-dim CLIP embedding.
+
+        Unlike encode_tensor_image, this applies CLIP's preprocessing (ImageNet
+        normalization) internally, matching what the env provides (pixel values
+        in [0,1], shape (B, 3, 224, 224)).
+
+        Used when CLIP serves as the observation encoder (baseline comparison
+        against DINOv2).
+
+        Args:
+            rgb: Float tensor of shape (B, 3, 224, 224), pixel values in [0, 1].
+
+        Returns:
+            Tensor of shape (B, 512), L2-normalised.
+        """
+        rgb = rgb.to(self.device)
+        if not hasattr(self, "_obs_norm"):
+            from torchvision import transforms
+            self._obs_norm = transforms.Normalize(
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711),
+            )
+        rgb = self._obs_norm(rgb)
+        embeddings = self._model.encode_image(rgb)
+        if self._normalize:
+            embeddings = F.normalize(embeddings, dim=-1)
+        return embeddings
+
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------

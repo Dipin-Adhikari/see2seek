@@ -183,38 +183,37 @@ class GRUActorCritic(nn.Module):
     """
     Single-layer GRU Actor-Critic policy for discrete-action navigation.
 
-    Consumes frozen DINOv2 (CLS + patch tokens) and CLIP goal embeddings.
-    The spatial-compression CNN and CLS projection are trainable; the GRU
-    provides temporal context.
+    Supports two observation encoder modes:
+        - "dino": DINOv2 spatial (patch tokens → SpatialCompressionHead) + CLS projection
+        - "clip": CLIP CLS observation embedding → trainable linear projection
+
+    The goal branch (CLIP 512-dim) is shared across both modes.
 
     Args:
+        obs_encoder_type:  "dino" or "clip". Default "dino".
         dino_patch_dim:    Per-patch DINOv2 token width. Default 768.
         dino_grid_size:    Side length of the DINOv2 patch grid. Default 16.
         dino_cls_dim:      DINOv2 CLS token width. Default 768.
+        clip_obs_dim:      CLIP obs embedding width. Default 512.
+        clip_obs_proj_dim: Projection dim for CLIP obs. Default 512.
         goal_embed_dim:    CLIP goal embedding width (fed raw, unprojected). Default 512.
-        cls_proj_dim:      CLS projection output width. Default 64.
-        use_cls:           If False, the CLS branch is dropped entirely from
-                            the fused vector (ablation switch). Default True.
+        cls_proj_dim:      CLS projection output width (dino mode). Default 64.
+        use_cls:           If False, the CLS branch is dropped (dino mode). Default True.
         hidden_size:       GRU hidden state size. Default 512.
         num_actions:       Size of the discrete action space. Default 4.
         num_action_embed:  Dimension of the learned prev-action embedding. Default 32.
         actor_hidden_dim:  Intermediate linear dim in actor head. Default 256.
         critic_hidden_dim: Intermediate linear dim in critic head. Default 256.
-
-    Note on policy_input_dim:
-        Computed automatically from the above as:
-            spatial_head.output_dim (1568)
-            + (cls_proj_dim if use_cls else 0)
-            + goal_embed_dim
-            + num_action_embed
-        Default: 1568 + 64 + 512 + 32 = 2176.
     """
 
     def __init__(
         self,
+        obs_encoder_type: str = "dino",
         dino_patch_dim: int = 768,
         dino_grid_size: int = 16,
         dino_cls_dim: int = 768,
+        clip_obs_dim: int = 512,
+        clip_obs_proj_dim: int = 512,
         goal_embed_dim: int = 512,
         cls_proj_dim: int = 64,
         use_cls: bool = True,
@@ -228,6 +227,7 @@ class GRUActorCritic(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.obs_encoder_type = obs_encoder_type
         self.hidden_size = hidden_size
         self.num_actions = num_actions
         self.use_cls = use_cls
@@ -235,14 +235,27 @@ class GRUActorCritic(nn.Module):
         self.num_action_embed = num_action_embed
         self.pointgoal_embed_dim = pointgoal_embed_dim
 
-        # ---- Spatial branch (trainable) ----
-        self.spatial_head = SpatialCompressionHead(
-            in_channels=dino_patch_dim, grid_size=dino_grid_size
-        )
+        if obs_encoder_type == "dino":
+            # ---- Spatial branch (trainable) ----
+            self.spatial_head = SpatialCompressionHead(
+                in_channels=dino_patch_dim, grid_size=dino_grid_size
+            )
+            # ---- CLS branch (trainable, ablatable) ----
+            self.cls_proj_dim = cls_proj_dim
+            self.cls_proj = LinearNormAct(dino_cls_dim, cls_proj_dim)
 
-        # ---- CLS branch (trainable, ablatable) ----
-        self.cls_proj_dim = cls_proj_dim
-        self.cls_proj = LinearNormAct(dino_cls_dim, cls_proj_dim)
+            obs_dim = (
+                self.spatial_head.output_dim
+                + (cls_proj_dim if use_cls else 0)
+            )
+        elif obs_encoder_type == "clip":
+            self.clip_obs_proj_dim = clip_obs_proj_dim
+            self.obs_proj = nn.Sequential(
+                LinearNormAct(clip_obs_dim, clip_obs_proj_dim),
+            )
+            obs_dim = clip_obs_proj_dim
+        else:
+            raise ValueError(f"Unknown obs_encoder_type: {obs_encoder_type}")
 
         # ---- Previous-action embedding ----
         self.prev_action_embed = nn.Embedding(
@@ -258,8 +271,7 @@ class GRUActorCritic(nn.Module):
 
         # ---- Fused input dim ----
         self.policy_input_dim = (
-            self.spatial_head.output_dim
-            + (cls_proj_dim if use_cls else 0)
+            obs_dim
             + goal_embed_dim
             + num_action_embed
             + pointgoal_embed_dim
@@ -289,11 +301,10 @@ class GRUActorCritic(nn.Module):
         self._init_weights()
 
         logger.info(
-            f"GRUActorCritic — policy_input_dim={self.policy_input_dim} "
-            f"(spatial={self.spatial_head.output_dim}, "
-            f"cls={cls_proj_dim if use_cls else 0}, "
-            f"goal={goal_embed_dim}, prev_action={num_action_embed}), "
-            f"hidden={hidden_size}, actions={num_actions}, use_cls={use_cls}"
+            f"GRUActorCritic [{obs_encoder_type}] — policy_input_dim={self.policy_input_dim} "
+            f"(obs={obs_dim}, goal={goal_embed_dim}, "
+            f"prev_action={num_action_embed}, pointgoal={pointgoal_embed_dim}), "
+            f"hidden={hidden_size}, actions={num_actions}"
         )
 
     # ------------------------------------------------------------------
@@ -313,16 +324,21 @@ class GRUActorCritic(nn.Module):
                     nn.init.orthogonal_(m.weight, gain=0.01)
                     nn.init.zeros_(m.bias)
 
-        for m in self.spatial_head.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight)
-                if m.bias is not None:
+        if self.obs_encoder_type == "dino":
+            for m in self.spatial_head.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.orthogonal_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            for m in self.cls_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight)
                     nn.init.zeros_(m.bias)
-
-        for m in self.cls_proj.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
-                nn.init.zeros_(m.bias)
+        elif self.obs_encoder_type == "clip":
+            for m in self.obs_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight)
+                    nn.init.zeros_(m.bias)
 
         for m in self.pointgoal_proj.modules():
             if isinstance(m, nn.Linear):
@@ -345,27 +361,35 @@ class GRUActorCritic(nn.Module):
         Build the flat fused input vector for a batch of timesteps.
 
         Args:
-            patch_embeds: (B, 256, 768) — DINOv2 patch tokens.
-            cls_embed:    (B, 768)      — DINOv2 CLS token.
-            goal_embed:   (B, 512)      — CLIP goal embedding (raw, unprojected).
-            prev_actions: (B,) long     — index of the action taken last step.
-            pointgoal:    (B, 3)        — [geodesic_dist, cos(angle), sin(angle)].
+            patch_embeds: (B, 256, 768) — DINOv2 patch tokens (dino mode),
+                          or None (clip mode).
+            cls_embed:    (B, 768) — DINOv2 CLS token (dino mode),
+                          or (B, 512) — CLIP obs embedding (clip mode).
+            goal_embed:   (B, 512) — CLIP goal embedding (raw, unprojected).
+            prev_actions: (B,) long — index of the action taken last step.
+            pointgoal:    (B, 3) — [geodesic_dist, cos(angle), sin(angle)].
 
         Returns:
             (B, policy_input_dim)
         """
-        spatial_feat = self.spatial_head(patch_embeds)          # (B, 1568), unit L2 norm
         prev_act_embed = self.prev_action_embed(prev_actions)   # (B, 32)
         pointgoal_feat = self.pointgoal_proj(pointgoal)         # (B, 32)
 
-        parts = [spatial_feat]
-        if self.use_cls:
-            cls_feat = self.cls_proj(cls_embed)                  # (B, 64)
-            cls_feat = F.normalize(cls_feat, p=2, dim=-1)
-            parts.append(cls_feat)                               # (B, 64), unit L2 norm
-        parts.append(goal_embed)                                # (B, 512), raw, unit L2 norm
-        parts.append(prev_act_embed)                             # (B, 32)
-        parts.append(pointgoal_feat)                             # (B, 32)
+        if self.obs_encoder_type == "dino":
+            spatial_feat = self.spatial_head(patch_embeds)       # (B, 1568)
+            parts = [spatial_feat]
+            if self.use_cls:
+                cls_feat = self.cls_proj(cls_embed)              # (B, 64)
+                cls_feat = F.normalize(cls_feat, p=2, dim=-1)
+                parts.append(cls_feat)
+        else:
+            obs_feat = self.obs_proj(cls_embed)                  # (B, clip_obs_proj_dim)
+            obs_feat = F.normalize(obs_feat, p=2, dim=-1)
+            parts = [obs_feat]
+
+        parts.append(goal_embed)                                # (B, 512)
+        parts.append(prev_act_embed)                            # (B, 32)
+        parts.append(pointgoal_feat)                            # (B, 32)
 
         return torch.cat(parts, dim=-1)
 
@@ -403,7 +427,7 @@ class GRUActorCritic(nn.Module):
             value:      (N, 1)          — state-value estimate.
             hidden_out: (1, N, hidden_size) — updated GRU hidden state.
         """
-        total_B    = patch_embeds.shape[0]   # N during rollout, chunk_len*num_chunks during update
+        total_B    = cls_embed.shape[0]       # N during rollout, chunk_len*num_chunks during update
         num_chunks = hidden.shape[1]         # hidden: (1, num_chunks, hidden_size)
         chunk_len  = total_B // num_chunks   # 1 during rollout, >1 during PPO update
 
@@ -493,32 +517,23 @@ class GRUActorCritic(nn.Module):
         goal_embed: torch.Tensor,
     ) -> dict:
         """
-        Diagnostic: mean per-sample L2 norm of each fusion branch, exactly as
-        they enter the concatenation in _fuse_inputs(). Use this to directly
-        verify branch scale parity (e.g. after adding LayerNorm to
-        SpatialCompressionHead) instead of inferring it indirectly from noisy
-        downstream RL metrics like entropy/value_loss.
-
-        A large, persistent gap between 'spatial' and 'goal' here means one
-        branch can structurally dominate the fused vector by magnitude alone,
-        independent of which is actually more informative — worth checking
-        any time training looks stuck.
+        Diagnostic: mean per-sample L2 norm of each fusion branch.
 
         Returns:
-            dict with keys 'spatial', 'cls' (only if use_cls), 'goal',
-            each a Python float (batch-mean L2 norm). With the current
-            L2-normalize-to-unit-norm treatment on spatial/cls, both should
-            read ~1.0, matching goal's exact 1.0 — if they don't, something
-            is broken in the normalization path itself.
+            dict with branch names → float (batch-mean L2 norm).
         """
-        spatial_feat = self.spatial_head(patch_embeds)   # (B, 1568), unit L2 norm
-        norms = {
-            "spatial": spatial_feat.norm(dim=-1).mean().item(),
-            "goal": goal_embed.norm(dim=-1).mean().item(),
-        }
-        if self.use_cls:
-            cls_feat = F.normalize(self.cls_proj(cls_embed), p=2, dim=-1)  # (B, 64), unit L2 norm
-            norms["cls"] = cls_feat.norm(dim=-1).mean().item()
+        norms = {"goal": goal_embed.norm(dim=-1).mean().item()}
+
+        if self.obs_encoder_type == "dino":
+            spatial_feat = self.spatial_head(patch_embeds)
+            norms["spatial"] = spatial_feat.norm(dim=-1).mean().item()
+            if self.use_cls:
+                cls_feat = F.normalize(self.cls_proj(cls_embed), p=2, dim=-1)
+                norms["cls"] = cls_feat.norm(dim=-1).mean().item()
+        else:
+            obs_feat = F.normalize(self.obs_proj(cls_embed), p=2, dim=-1)
+            norms["obs"] = obs_feat.norm(dim=-1).mean().item()
+
         return norms
 
 
@@ -530,14 +545,6 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
     """
     Construct a GRUActorCritic from a Config object.
 
-    Expects the following (new) fields on cfg.encoder:
-        dino_patch_dim   (default 768)
-        dino_grid_size   (default 16)
-        dino_cls_dim     (default 768)
-        goal_embed_dim   (default 512)
-        cls_proj_dim     (default 64)
-        use_cls          (default True)
-
     Args:
         cfg:    configs.config.Config instance.
         device: Device string.
@@ -547,9 +554,12 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
     """
     enc = cfg.encoder
     policy = GRUActorCritic(
+        obs_encoder_type=getattr(enc, "obs_encoder_type", "dino"),
         dino_patch_dim=getattr(enc, "dino_patch_dim", 768),
         dino_grid_size=getattr(enc, "dino_grid_size", 16),
         dino_cls_dim=getattr(enc, "dino_cls_dim", 768),
+        clip_obs_dim=getattr(enc, "goal_embed_dim", 512),
+        clip_obs_proj_dim=getattr(enc, "clip_obs_proj_dim", 512),
         goal_embed_dim=getattr(enc, "goal_embed_dim", 512),
         cls_proj_dim=getattr(enc, "cls_proj_dim", 64),
         use_cls=getattr(enc, "use_cls", True),

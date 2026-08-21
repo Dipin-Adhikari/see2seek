@@ -53,9 +53,13 @@ class Evaluator:
         self.cfg = cfg
         self.device = torch.device(device or cfg.device)
         self.num_envs = num_envs or cfg.env.num_envs
+        self.obs_encoder_type = getattr(cfg.encoder, "obs_encoder_type", "dino")
 
         # ---- Load encoders ----
-        self.obs_encoder  = DINOv2Encoder(device=str(self.device))
+        if self.obs_encoder_type == "dino":
+            self.obs_encoder = DINOv2Encoder(device=str(self.device))
+        else:
+            self.obs_encoder = None
         self.goal_encoder = CLIPGoalEncoder(device=str(self.device))
 
         # ---- Load policy ----
@@ -75,6 +79,7 @@ class Evaluator:
         task: TaskType = "imagenav",
         num_episodes: Optional[int] = None,
         log_file: Optional[str] = None,
+        zero_pointgoal: bool = False,
     ) -> Dict[str, float]:
         """
         Run parallel evaluation and return metric dict.
@@ -137,9 +142,14 @@ class Evaluator:
 
             with torch.no_grad():
                 rgb = obs_dict["rgb"].to(self.device)
-                cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                if self.obs_encoder_type == "dino":
+                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                else:
+                    cls_embed = self.goal_encoder.get_obs_embedding(rgb)
+                    patch_embed = None
+
                 goal_embed = obs_dict["goal"].to(self.device)
-                if task == "objectnav":
+                if task == "objectnav" or zero_pointgoal:
                     pointgoal = torch.zeros(self.num_envs, 3, device=self.device)
                 else:
                     pointgoal = obs_dict["pointgoal"].to(self.device)

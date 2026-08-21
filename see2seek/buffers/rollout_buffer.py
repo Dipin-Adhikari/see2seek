@@ -165,9 +165,11 @@ class RolloutBuffer:
         )
         sd, sdt = self.storage_device, self.store_dtype
 
-        # Raw frozen-encoder outputs (large — see module docstring on
-        # store_dtype/storage_device for memory management).
-        self.patch_embeds = torch.zeros(T, N, P, D_patch, device=sd, dtype=sdt)
+        # Raw frozen-encoder outputs
+        if P > 0 and D_patch > 0:
+            self.patch_embeds = torch.zeros(T, N, P, D_patch, device=sd, dtype=sdt)
+        else:
+            self.patch_embeds = None
         self.cls_embeds   = torch.zeros(T, N, D_cls,       device=sd, dtype=sdt)
         self.goal_embeds  = torch.zeros(T, N, D_goal,       device=sd, dtype=sdt)
 
@@ -203,7 +205,7 @@ class RolloutBuffer:
 
     def insert(
         self,
-        patch_embed:  torch.Tensor,
+        patch_embed:  Optional[torch.Tensor],
         cls_embed:    torch.Tensor,
         goal_embed:   torch.Tensor,
         action:       torch.Tensor,
@@ -220,9 +222,10 @@ class RolloutBuffer:
         Insert one time-step of data from all environments.
 
         Args:
-            patch_embed: (N, num_patches, patch_dim) — raw DINOv2 patch tokens.
-            cls_embed:   (N, cls_dim)                — raw DINOv2 CLS token.
-            goal_embed:  (N, goal_dim)                — CLIP goal embedding.
+            patch_embed: (N, num_patches, patch_dim) — raw DINOv2 patch tokens,
+                         or None when obs_encoder_type=="clip".
+            cls_embed:   (N, cls_dim) — raw DINOv2 CLS token or CLIP obs embedding.
+            goal_embed:  (N, goal_dim) — CLIP goal embedding.
             action:      (N,) long
             prev_action: (N,) long
             reward:      (N,)
@@ -235,9 +238,10 @@ class RolloutBuffer:
         """
         t = self._step
 
-        self.patch_embeds[t] = patch_embed.detach().to(
-            device=self.storage_device, dtype=self.store_dtype
-        )
+        if self.patch_embeds is not None and patch_embed is not None:
+            self.patch_embeds[t] = patch_embed.detach().to(
+                device=self.storage_device, dtype=self.store_dtype
+            )
         self.cls_embeds[t] = cls_embed.detach().to(
             device=self.storage_device, dtype=self.store_dtype
         )
@@ -393,7 +397,8 @@ class RolloutBuffer:
             t_idx_storage = (start_steps_storage + local_t).clamp(max=self.num_steps - 1)
             t_idx = (start_steps + local_t).clamp(max=self.num_steps - 1)
 
-            patch_list.append(self.patch_embeds[t_idx_storage, env_ids_storage])
+            if self.patch_embeds is not None:
+                patch_list.append(self.patch_embeds[t_idx_storage, env_ids_storage])
             cls_list.append(self.cls_embeds[t_idx_storage, env_ids_storage])
             goal_list.append(self.goal_embeds[t_idx_storage, env_ids_storage])
 
@@ -410,10 +415,11 @@ class RolloutBuffer:
         def _flat(lst):
             return torch.stack(lst, dim=0).reshape(-1, *lst[0].shape[1:])
 
-        # Large tensors: cast to float32 and move to compute device here —
-        # only this chunk-sized slice crosses the storage->compute boundary,
-        # not the whole buffer.
-        patch_batch = _flat(patch_list).to(device=self.device, dtype=torch.float32)
+        # Large tensors: cast to float32 and move to compute device here
+        if patch_list:
+            patch_batch = _flat(patch_list).to(device=self.device, dtype=torch.float32)
+        else:
+            patch_batch = None
         cls_batch   = _flat(cls_list).to(device=self.device, dtype=torch.float32)
         goal_batch  = _flat(goal_list).to(device=self.device, dtype=torch.float32)
 

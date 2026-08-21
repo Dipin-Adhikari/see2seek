@@ -59,22 +59,33 @@ class PPOTrainer:
     def __init__(self, cfg: Config, resume: Optional[str] = None) -> None:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
+        self.obs_encoder_type = getattr(cfg.encoder, "obs_encoder_type", "dino")
 
         # ---- Logging ----
         self._setup_logging()
 
         # ---- Encoders (frozen, shared across all updates) ----
-        logger.info("Building encoders ...")
-        self.obs_encoder  = DINOv2Encoder(
-            device=cfg.device,
-            normalize=cfg.encoder.obs_normalize,
-        )
+        logger.info(f"Building encoders (obs_encoder={self.obs_encoder_type}) ...")
+        if self.obs_encoder_type == "dino":
+            self.obs_encoder = DINOv2Encoder(
+                device=cfg.device,
+                normalize=cfg.encoder.obs_normalize,
+            )
+            buf_patch_dim = self.obs_encoder.patch_dim
+            buf_num_patches = self.obs_encoder.num_patches
+            buf_cls_dim = self.obs_encoder.embed_dim
+        else:
+            self.obs_encoder = None  # CLIP handles obs encoding
+            buf_patch_dim = 0
+            buf_num_patches = 0
+            buf_cls_dim = cfg.encoder.goal_embed_dim  # 512
+
         self.goal_encoder = CLIPGoalEncoder(
             device=cfg.device,
             normalize=cfg.encoder.goal_normalize,
         )
 
-        # ---- Policy (trainable — includes SpatialCompressionHead + CLS proj) ----
+        # ---- Policy (trainable) ----
         logger.info("Building GRU Actor-Critic policy ...")
         self.policy = build_policy(cfg, cfg.device)
 
@@ -90,16 +101,12 @@ class PPOTrainer:
         self.vec_env = make_vec_envs(cfg)
 
         # ---- Rollout buffer ----
-        # storage_device/store_dtype are optional memory knobs — see
-        # rollout_buffer.py docstring. Defaulting storage to the same
-        # compute device here; if you hit OOM at your num_steps/num_envs,
-        # pass storage_device=torch.device("cpu") instead.
         self.buffer = RolloutBuffer(
             num_steps=cfg.ppo.num_steps,
             num_envs=cfg.env.num_envs,
-            patch_dim=self.obs_encoder.patch_dim,
-            num_patches=self.obs_encoder.num_patches,
-            cls_dim=self.obs_encoder.embed_dim,
+            patch_dim=buf_patch_dim,
+            num_patches=buf_num_patches,
+            cls_dim=buf_cls_dim,
             goal_dim=cfg.encoder.goal_embed_dim,
             hidden_size=cfg.policy.hidden_size,
             num_actions=cfg.env.num_actions,
@@ -192,14 +199,14 @@ class PPOTrainer:
 
             for _ in range(cfg.ppo.num_steps):
                 with torch.no_grad():
-                    # 1a. Encode observation (DINOv2 — frozen). Single
-                    # backbone forward pass returns BOTH CLS and patch
-                    # tokens — do not call forward()/get_patch_embeddings()
-                    # separately here, that would run the ViT twice.
-                    rgb = obs_dict["rgb"].to(self.device)                    # (N, 3, H, W)
-                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
-                    # cls_embed:   (N, 768)
-                    # patch_embed: (N, 256, 768)
+                    rgb = obs_dict["rgb"].to(self.device)  # (N, 3, H, W)
+
+                    # 1a. Encode observation (frozen backbone)
+                    if self.obs_encoder_type == "dino":
+                        cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                    else:
+                        cls_embed = self.goal_encoder.get_obs_embedding(rgb)  # (N, 512)
+                        patch_embed = None
 
                     # 1b. Encode goal (CLIP — frozen; cached)
                     goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
@@ -276,7 +283,11 @@ class PPOTrainer:
             # ---- Phase 2: Compute returns ----
             with torch.no_grad():
                 rgb = obs_dict["rgb"].to(self.device)
-                cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                if self.obs_encoder_type == "dino":
+                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                else:
+                    cls_embed = self.goal_encoder.get_obs_embedding(rgb)
+                    patch_embed = None
                 goal_embed = self._get_goal_embeddings(obs_dict)
                 pointgoal = obs_dict["pointgoal"].to(self.device)
                 _, last_value, _ = self.policy.act(
@@ -284,12 +295,6 @@ class PPOTrainer:
                     pointgoal=pointgoal,
                 )
 
-                # ---- Branch-norm diagnostic (gated to avoid log spam) ----
-                # Reuses the observation just encoded above — no extra
-                # DINOv2/CLIP forward passes. Confirms directly whether the
-                # spatial branch's scale is comparable to the goal branch's
-                # (see SpatialCompressionHead's LayerNorm), rather than
-                # inferring it indirectly from entropy/value_loss trends.
                 if self._num_updates % cfg.ppo.log_interval == 0:
                     self._log_branch_norms(patch_embed, cls_embed, goal_embed)
 

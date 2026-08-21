@@ -43,18 +43,18 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "train"                    # "train" | "val" | "test"
-    # split: str = "val"
+    # split: str = "train"                    # "train" | "val" | "test"
+    split: str = "val"
 
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
     # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
@@ -87,7 +87,7 @@ class EnvConfig:
     min_steps_before_stop: int = 20                # don't allow Stop until this many steps
 
     # --- Parallelism ---
-    num_envs: int = 16                    # number of parallel rollout workers
+    num_envs: int = 1                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,9 @@ class EnvConfig:
 @dataclass
 class EncoderConfig:
     """Frozen visual encoder settings + fusion architecture parameters."""
+
+    # --- Observation encoder selection ---
+    obs_encoder_type: str = "dino"         # "dino" (DINOv2 ViT-B/14) or "clip" (CLIP ViT-B/32)
 
     # --- Observation encoder: DINOv2 ViT-B/14 ---
     obs_encoder: str = "dinov2_vitb14"     # torch.hub model name
@@ -136,17 +139,19 @@ class EncoderConfig:
     pointgoal_embed_dim: int = 32          # projected dim of pointgoal sensor
     pointgoal_dropout: float = 0.5         # probability of zeroing pointgoal (for ObjectNav transfer)
 
+    # --- CLIP obs encoder settings (used when obs_encoder_type == "clip") ---
+    clip_obs_proj_dim: int = 512           # projection dim for CLIP obs embedding
+
     # --- Combined policy input ---
-    # policy_input_dim = spatial_compressed_dim
-    #                   + (cls_proj_dim if use_cls else 0)
-    #                   + goal_embed_dim
-    #                   + action_embed_dim
-    #                   + pointgoal_embed_dim
     @property
     def policy_input_dim(self) -> int:
-        cls_dim = self.cls_proj_dim if self.use_cls else 0
-        return (self.spatial_compressed_dim + cls_dim + self.goal_embed_dim
-                + self.action_embed_dim + self.pointgoal_embed_dim)
+        if self.obs_encoder_type == "clip":
+            return (self.clip_obs_proj_dim + self.goal_embed_dim
+                    + self.action_embed_dim + self.pointgoal_embed_dim)
+        else:
+            cls_dim = self.cls_proj_dim if self.use_cls else 0
+            return (self.spatial_compressed_dim + cls_dim + self.goal_embed_dim
+                    + self.action_embed_dim + self.pointgoal_embed_dim)
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,9 @@ def parse_args():
     p.add_argument("--num_episodes", type=int, default=None, help="Max episodes (None=all)")
     p.add_argument("--num_envs",   type=int, default=None, help="Parallel envs (default: from config)")
     p.add_argument("--min_steps_before_stop", type=int, default=None, help="Override min steps before stop (default: from config)")
+    p.add_argument("--obs_encoder", default=None, choices=["dino", "clip"],
+                   help="Observation encoder: dino (DINOv2) or clip (CLIP baseline)")
+    p.add_argument("--zero_pointgoal", action="store_true", help="Zero out PointGoal (test visual-only navigation)")
     p.add_argument("--log_file",   default=None, help="Path to save eval log (auto-generated if None)")
     p.add_argument("--device",     default=None)
     return p.parse_args()
@@ -46,6 +49,8 @@ def main():
 
     if args.device:
         cfg.device = args.device
+    if args.obs_encoder:
+        cfg.encoder.obs_encoder_type = args.obs_encoder
     if args.min_steps_before_stop is not None:
         cfg.env.min_steps_before_stop = args.min_steps_before_stop
 
@@ -60,6 +65,7 @@ def main():
         task=args.task,
         num_episodes=args.num_episodes,
         log_file=args.log_file,
+        zero_pointgoal=args.zero_pointgoal,
     )
 
     print("\n=== Evaluation Results ===")
