@@ -53,7 +53,19 @@ class Evaluator:
         self.cfg = cfg
         self.device = torch.device(device or cfg.device)
         self.num_envs = num_envs or cfg.env.num_envs
-        self.obs_encoder_type = getattr(cfg.encoder, "obs_encoder_type", "dino")
+
+        # Auto-detect obs_encoder_type from checkpoint if not explicitly set
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        ckpt_cfg = ckpt.get("cfg", None)
+        if ckpt_cfg is not None:
+            ckpt_enc_type = getattr(getattr(ckpt_cfg, "encoder", None), "obs_encoder_type", None)
+            if ckpt_enc_type and cfg.encoder.obs_encoder_type == "dino":
+                # Override with checkpoint's encoder type (unless user explicitly set it)
+                cfg.encoder.obs_encoder_type = ckpt_enc_type
+                if ckpt_enc_type != "dino":
+                    logger.info(f"Auto-detected obs_encoder_type='{ckpt_enc_type}' from checkpoint")
+
+        self.obs_encoder_type = cfg.encoder.obs_encoder_type
 
         # ---- Load encoders ----
         if self.obs_encoder_type == "dino":
@@ -64,10 +76,11 @@ class Evaluator:
 
         # ---- Load policy ----
         self.policy = build_policy(cfg, str(self.device))
-        self._load_checkpoint(checkpoint_path)
+        self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.policy.eval()
+        logger.info(f"Loaded checkpoint (step {ckpt.get('total_steps', '?'):,})")
 
-        logger.info(f"Evaluator ready — checkpoint: {checkpoint_path}, num_envs: {self.num_envs}")
+        logger.info(f"Evaluator ready — obs_encoder={self.obs_encoder_type}, checkpoint: {checkpoint_path}, num_envs: {self.num_envs}")
 
     # ------------------------------------------------------------------
     # Main evaluation
@@ -252,9 +265,8 @@ class Evaluator:
     # ------------------------------------------------------------------
 
     def _load_checkpoint(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.policy.load_state_dict(ckpt["policy_state_dict"])
-        logger.info(f"Loaded checkpoint (step {ckpt.get('total_steps', '?'):,})")
+        """Legacy method — checkpoint loading is now done in __init__."""
+        pass
 
     @staticmethod
     def _get_category_map(language: str) -> Dict[str, str]:

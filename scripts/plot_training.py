@@ -67,9 +67,55 @@ def parse_log(log_path):
     return metrics, actions
 
 
+def merge_logs(log_files):
+    """Parse multiple log files and concatenate their metrics/actions in order."""
+    merged_metrics = {
+        "steps": [], "update": [],
+        "policy_loss": [], "value_loss": [], "entropy": [],
+        "reward": [], "SR": [], "SPL": [], "fps": [],
+    }
+    merged_actions = {
+        "steps": [],
+        "MoveAhead": [], "RotateLeft": [], "RotateRight": [], "Stop": [],
+    }
+
+    for log_path in log_files:
+        metrics, actions = parse_log(log_path)
+
+        if len(metrics["steps"]) == 0:
+            print(f"  Skipping {log_path.name}: no metrics found")
+            continue
+
+        # Offset steps so each subsequent file's steps continue from where
+        # the previous one left off (handles resumed-training logs where
+        # each run restarts its own step counter at/near 0).
+        step_offset = merged_metrics["steps"][-1] if merged_metrics["steps"] else 0
+        if metrics["steps"][0] < step_offset:
+            offset = step_offset
+        else:
+            offset = 0  # steps already continue naturally (e.g. same run split across files)
+
+        for key in merged_metrics:
+            if key == "steps":
+                merged_metrics["steps"].extend(s + offset for s in metrics["steps"])
+            else:
+                merged_metrics[key].extend(metrics[key])
+
+        for key in merged_actions:
+            if key == "steps":
+                merged_actions["steps"].extend(s + offset for s in actions["steps"])
+            else:
+                merged_actions[key].extend(actions[key])
+
+        print(f"  {log_path.name}: {len(metrics['steps'])} updates "
+              f"({metrics['steps'][0]:,} -> {metrics['steps'][-1]:,})")
+
+    return merged_metrics, merged_actions
+
+
 def plot_metrics(metrics, actions, save_path=None):
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle("See2Seek Training Progress", fontsize=14, fontweight="bold")
+    fig.suptitle("See2Seek Training Progress (All Runs)", fontsize=14, fontweight="bold")
 
     steps_k = [s / 1000 for s in metrics["steps"]]
 
@@ -152,25 +198,23 @@ def plot_metrics(metrics, actions, save_path=None):
 
 
 if __name__ == "__main__":
-    log_dir = Path("data_new/logs")
+    log_dir = Path("data_clip/logs")
     log_files = sorted(log_dir.glob("train_*.log"))
 
     if not log_files:
-        print("No log files found in data_new/logs/")
+        print("No log files found in data_clip/logs/")
         sys.exit(1)
 
-    log_path = log_files[-1]
-    print(f"Parsing: {log_path}")
-
-    metrics, actions = parse_log(log_path)
-    print(f"Found {len(metrics['steps'])} update entries")
+    print(f"Found {len(log_files)} log file(s), parsing all...")
+    metrics, actions = merge_logs(log_files)
 
     if len(metrics["steps"]) == 0:
-        print("No metrics found in log file")
+        print("No metrics found in any log file")
         sys.exit(1)
 
+    print(f"\nTotal: {len(metrics['steps'])} update entries")
     print(f"Steps: {metrics['steps'][0]:,} -> {metrics['steps'][-1]:,}")
     print(f"Latest SR={metrics['SR'][-1]:.3f}  SPL={metrics['SPL'][-1]:.3f}  Reward={metrics['reward'][-1]:.3f}")
 
-    save_path = "data_new/training_curves.png"
+    save_path = "data_clip/training_curves.png"
     plot_metrics(metrics, actions, save_path=save_path)

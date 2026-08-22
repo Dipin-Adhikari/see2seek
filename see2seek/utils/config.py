@@ -87,7 +87,7 @@ class EnvConfig:
     min_steps_before_stop: int = 20                # don't allow Stop until this many steps
 
     # --- Parallelism ---
-    num_envs: int = 16                    # number of parallel rollout workers
+    num_envs: int = 1                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
