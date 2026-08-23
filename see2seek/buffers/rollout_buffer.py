@@ -79,7 +79,7 @@ class RecurrentBatch(NamedTuple):
     cls_embeds:     torch.Tensor    # (chunk_len * num_chunks, 768)
     goal_embeds:    torch.Tensor    # (chunk_len * num_chunks, 512)
     prev_actions:   torch.Tensor    # (chunk_len * num_chunks,)
-    hidden_states:  torch.Tensor    # (1, num_chunks, hidden_size)
+    hidden_states:  torch.Tensor    # (num_layers, num_chunks, hidden_size)
     masks:          torch.Tensor    # (chunk_len * num_chunks, 1)
     actions:        torch.Tensor    # (chunk_len * num_chunks,)
     old_log_probs:  torch.Tensor    # (chunk_len * num_chunks,)
@@ -132,6 +132,7 @@ class RolloutBuffer:
         num_actions: int,
         device: torch.device,
         pointgoal_dim: int = 3,
+        num_recurrent_layers: int = 2,
         storage_device: Optional[torch.device] = None,
         store_dtype: torch.dtype = torch.float16,
     ) -> None:
@@ -145,6 +146,7 @@ class RolloutBuffer:
         self.num_actions = num_actions
         self.device = device
         self.pointgoal_dim = pointgoal_dim
+        self.num_recurrent_layers = num_recurrent_layers
         self.storage_device = storage_device if storage_device is not None else device
         self.store_dtype = store_dtype
 
@@ -192,8 +194,10 @@ class RolloutBuffer:
         self.log_probs = torch.zeros(T,   N, device=self.device)
 
         # GRU hidden states (stored at EVERY step for recurrent mini-batches)
-        # Shape: (T+1, 1, N, D_h) — 1 is GRU num_layers
-        self.hidden_states = torch.zeros(T+1, 1, N, D_h, device=self.device)
+        # Shape: (T+1, num_layers, N, D_h)
+        self.hidden_states = torch.zeros(
+            T+1, self.num_recurrent_layers, N, D_h, device=self.device
+        )
 
         # Computed after rollout ends
         self.returns    = torch.zeros(T, N, device=self.device)
@@ -423,12 +427,14 @@ class RolloutBuffer:
         cls_batch   = _flat(cls_list).to(device=self.device, dtype=torch.float32)
         goal_batch  = _flat(goal_list).to(device=self.device, dtype=torch.float32)
 
-        # Hidden state at the start of each chunk: shape (1, num_chunks, hidden_size)
+        # Hidden state at the start of each chunk: shape (num_layers, num_chunks, hidden_size)
         # hidden_states[t] is the hidden BEFORE step t
         h_idx = start_steps
-        hidden_batch = self.hidden_states[
-            h_idx, 0, env_ids, :
-        ].unsqueeze(0)   # (1, num_chunks, D_h)
+        num_layers = self.num_recurrent_layers
+        hidden_batch = torch.stack([
+            self.hidden_states[h_idx, layer, env_ids, :]
+            for layer in range(num_layers)
+        ], dim=0)   # (num_layers, num_chunks, D_h)
 
         return RecurrentBatch(
             patch_embeds  = patch_batch,

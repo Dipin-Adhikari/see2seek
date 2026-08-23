@@ -112,6 +112,7 @@ class PPOTrainer:
             num_actions=cfg.env.num_actions,
             device=self.device,
             pointgoal_dim=cfg.encoder.pointgoal_input_dim,
+            num_recurrent_layers=getattr(cfg.policy, "num_recurrent_layers", 2),
             storage_device=getattr(cfg.ppo, "buffer_storage_device", None),
             store_dtype=getattr(cfg.ppo, "buffer_store_dtype", torch.float16),
         )
@@ -191,6 +192,19 @@ class PPOTrainer:
             (cfg.env.num_envs,), cfg.env.num_actions, dtype=torch.long, device=self.device
         )   # num_actions index = "no previous action" padding
 
+        # Episodic memory buffers (per-env, persisted across rollouts)
+        memory_size = getattr(cfg.encoder, "memory_size", 64)
+        cls_dim_for_mem = (
+            cfg.encoder.dino_cls_dim if self.obs_encoder_type == "dino"
+            else cfg.encoder.goal_embed_dim
+        )
+        memory_buffer = torch.zeros(
+            cfg.env.num_envs, memory_size, cls_dim_for_mem, device=self.device
+        )
+        memory_mask = torch.zeros(
+            cfg.env.num_envs, memory_size, device=self.device, dtype=torch.bool
+        )
+
         steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)
         while self._total_steps < cfg.ppo.total_num_steps:
             # ---- Phase 1: Collect rollout ----
@@ -220,10 +234,11 @@ class PPOTrainer:
                                      > cfg.encoder.pointgoal_dropout).float()
                         pointgoal = pointgoal * drop_mask
 
-                    # 1d. Policy forward
-                    dist, value, hidden_next = self.policy.act(
+                    # 1d. Policy forward (with episodic memory)
+                    dist, value, hidden_next, memory_buffer, memory_mask = self.policy.act(
                         patch_embed, cls_embed, goal_embed, prev_actions,
                         hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
+                        memory_buffer=memory_buffer, memory_mask=memory_mask,
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
@@ -252,9 +267,7 @@ class PPOTrainer:
                 # 1e. Build masks for NEXT step (0 if this step was terminal)
                 new_masks = (~dones).float().unsqueeze(1).to(self.device)  # (N, 1)
 
-                # 1f. Insert into buffer (raw patch/CLS tokens — the
-                # trainable SpatialCompressionHead / CLS proj re-run on
-                # these during evaluate_actions()).
+                # 1f. Insert into buffer
                 self.buffer.insert(
                     patch_embed = patch_embed,
                     cls_embed   = cls_embed,
@@ -290,9 +303,10 @@ class PPOTrainer:
                     patch_embed = None
                 goal_embed = self._get_goal_embeddings(obs_dict)
                 pointgoal = obs_dict["pointgoal"].to(self.device)
-                _, last_value, _ = self.policy.act(
+                _, last_value, _, memory_buffer, memory_mask = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks,
                     pointgoal=pointgoal,
+                    memory_buffer=memory_buffer, memory_mask=memory_mask,
                 )
 
                 if self._num_updates % cfg.ppo.log_interval == 0:

@@ -145,6 +145,19 @@ class Evaluator:
         masks = torch.ones(self.num_envs, 1, device=self.device)
         steps_since_reset = torch.zeros(self.num_envs, device=self.device)
 
+        # Episodic memory buffers
+        memory_size = getattr(self.cfg.encoder, "memory_size", 64)
+        cls_dim_for_mem = (
+            self.cfg.encoder.dino_cls_dim if self.obs_encoder_type == "dino"
+            else self.cfg.encoder.goal_embed_dim
+        )
+        memory_buffer = torch.zeros(
+            self.num_envs, memory_size, cls_dim_for_mem, device=self.device
+        )
+        memory_mask = torch.zeros(
+            self.num_envs, memory_size, device=self.device, dtype=torch.bool
+        )
+
         episode_count = 0
         total_steps = 0
         start_time = time.time()
@@ -169,9 +182,10 @@ class Evaluator:
 
                 can_stop = steps_since_reset >= self.cfg.env.min_steps_before_stop
 
-                dist, _, hidden_next = self.policy.act(
+                dist, _, hidden_next, memory_buffer, memory_mask = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions,
                     hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
+                    memory_buffer=memory_buffer, memory_mask=memory_mask,
                 )
                 actions = dist.sample()
 

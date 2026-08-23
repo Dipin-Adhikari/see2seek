@@ -1,64 +1,41 @@
 """
 gru_policy.py — GRU-based Actor-Critic policy for embodied navigation.
 
-Architecture (ZSON/EmbCLIP-inspired spatial fusion):
+Architecture (spatial fusion + episodic memory):
 
-    Frozen backbones (outside this module, see dino_encoder.py / clip_encoder.py):
+    Frozen backbones (outside this module):
         DINOv2 ViT-B/14  -> cls_embed    (B, 768)
                           -> patch_embeds (B, 256, 768)   16x16 grid
         CLIP   ViT-B/32  -> goal_embed   (B, 512)
 
-    Four independent branches (no cross-conditioning between them):
+    Trainable branches:
 
-    1. Spatial branch (trainable, SpatialCompressionHead):
-           patch_embeds (B, 256, 768)
-           -> reshape (B, 16, 16, 768) -> permute (B, 768, 16, 16)
-           -> 2-layer CNN (EmbCLIP-style compression) -> (B, 32, 7, 7)
-           -> flatten -> (B, 1568)
-       This is the only branch carrying "where things are" spatial info.
-       Unlike EmbCLIP, no goal-tiling happens here — goal fusion is deferred
-       to the flat concatenation below (ZSON-style).
+    1. Spatial branch (SpatialCompressionHead):
+           patch_embeds (B, 256, 768) -> CNN -> (B, 1568)
 
-    2. CLS branch (trainable, small linear projection):
-           cls_embed (B, 768) -> Linear/LayerNorm/ELU -> (B, 64)
-       Light global scene context ("this is a bedroom"). Gated by `use_cls`
-       so it can be ablated to check whether it earns its 64 dims.
+    2. CLS branch (linear projection):
+           cls_embed (B, 768) -> Linear/LN/ELU -> (B, 64)
 
-    3. Goal branch (no projection — fed raw):
-           goal_embed (B, 512) passed through unchanged.
+    3. Goal branch (trainable projection):
+           goal_embed (B, 512) -> Linear/LN/ELU -> (B, 512)
 
-    4. Previous-action branch:
-           learned embedding, (B, 32).
+    4. Episodic memory (cross-attention over past CLS tokens):
+           query=current_cls, KV=past_cls_buffer -> (B, 128)
 
-    Fusion (flat concat, single fusion point):
-        1568 (spatial) + 64 (CLS-proj, if use_cls) + 512 (goal, raw) + 32 (prev action)
-        = 2176-dim (or 2112-dim if use_cls=False)
+    5. Previous-action branch: embedding -> (B, 32)
 
-    Recurrent policy: 1-layer GRU, hidden_size=512, input_size=policy_input_dim.
-    (2-layer GRU is a deliberately separate, later ablation — see project
-    notes; keep this validation run isolated to the encoder change alone.)
+    6. PointGoal branch: [d,cos,sin] -> Linear/ReLU -> (B, 32)
 
-Design notes:
-    - Hidden state (h_t) is the agent's episodic memory and MUST be
-      correctly propagated across steps and reset at episode boundaries.
-    - The SpatialCompressionHead and CLS projection are TRAINABLE — unlike
-      the frozen DINOv2/CLIP backbones, gradients flow through them during
-      PPO updates. This means the RolloutBuffer must store raw patch tokens
-      (and raw CLS embeddings), not pre-compressed vectors, so the compression
-      head can be re-run (with gradients) during evaluate_actions() in every
-      PPO epoch. See rollout_buffer.py for the buffer-side implications.
-    - Recurrent PPO requires chunked mini-batch updates; the RolloutBuffer
-      handles storing and replaying hidden states correctly.
+    Fusion (flat concat):
+        1568 + 64 + 512 + 128 + 32 + 32 = 2336-dim
 
-Usage:
-    policy = GRUActorCritic(
-        hidden_size=512,
-        num_actions=4,
-        use_cls=True,
-    )
-    dist, value, h_next = policy.act(
-        patch_embeds, cls_embed, goal_embed, prev_action, h_prev, masks
-    )
+    Recurrent policy: 2-layer GRU, hidden_size=512.
+
+    The episodic memory operates within the recurrent loop: at each
+    timestep, the current CLS token queries a buffer of past CLS tokens
+    via single-head cross-attention. The buffer is built up step-by-step
+    (no BPTT through time — stored tokens are detached). This gives the
+    agent a "have I seen this before?" signal for loop detection.
 """
 
 from __future__ import annotations
@@ -79,7 +56,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class LinearNormAct(nn.Sequential):
-    """Linear → LayerNorm → ELU block used in Actor/Critic heads and CLS proj."""
+    """Linear -> LayerNorm -> ELU block."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__(
@@ -91,31 +68,10 @@ class LinearNormAct(nn.Sequential):
 
 class SpatialCompressionHead(nn.Module):
     """
-    Trainable 2-layer CNN (EmbCLIP-style) that compresses DINOv2's flat
-    patch-token sequence into a compact spatial feature vector.
+    Trainable 2-layer CNN that compresses DINOv2 patch tokens into a
+    compact spatial feature vector.
 
-    Input:  patch_tokens (B, 256, 768) — DINOv2's flat row-major patch
-            sequence (index = row * 16 + col) over a 16x16 grid.
-    Output: (B, 1568) — flattened 32x7x7 compressed grid.
-
-    Reshape correctness (this matters — a naive reshape scrambles space):
-        patch_tokens.view(B, 16, 16, 768)   # spatial layout preserved:
-                                             # row-major (256,) -> (16,16)
-                                             # is a safe, order-preserving
-                                             # reshape since PyTorch's
-                                             # .view() is also row-major.
-        .permute(0, 3, 1, 2)                # (B, 16, 16, 768) -> (B, 768, 16, 16)
-                                             # NCHW for Conv2d.
-        Do NOT do patch_tokens.reshape(B, 768, 16, 16) directly — that
-        reads the wrong axis as the spatial one and produces garbage
-        spatial locations despite looking shape-correct.
-
-    Conv dims (16x16 -> 7x7, verified):
-        Conv2d(768, 128, kernel_size=3, stride=2, padding=0):
-            out = floor((16 - 3) / 2) + 1 = 7           -> (B, 128, 7, 7)
-        Conv2d(128, 32,  kernel_size=3, stride=1, padding=1):
-            out = 7 (padding=1 preserves spatial size)  -> (B, 32, 7, 7)
-        flatten -> (B, 1568)
+    Input:  (B, 256, 768) -> Output: (B, 1568)
     """
 
     def __init__(self, in_channels: int = 768, grid_size: int = 16) -> None:
@@ -127,25 +83,6 @@ class SpatialCompressionHead(nn.Module):
             nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
         )
-        # Scale-matching note: the goal branch (CLIP, see clip_encoder.py) is
-        # L2-normalised to an exact unit vector norm (||goal|| == 1.0). This
-        # branch's raw post-ReLU conv output has no such constraint.
-        #
-        # IMPORTANT — LayerNorm alone does NOT fix this. LayerNorm normalises
-        # each element to ~zero-mean/unit-VARIANCE, not the vector's total L2
-        # norm. For a D-dim vector with each element at ~unit variance, the L2
-        # norm is ~sqrt(D), not ~1. Measured empirically via
-        # GRUActorCritic.branch_norms(): LayerNorm(1568) alone produced
-        # spatial norm ~39.6 == sqrt(1568), while the goal branch is 1.0 —
-        # a ~40x gap, i.e. LayerNorm alone did not close the scale mismatch it
-        # was added to fix. F.normalize() below rescales the *total* vector
-        # norm to exactly 1.0, matching the goal branch's actual scale rather
-        # than just equalising per-element variance. (Using an explicit L2
-        # normalize rather than a fixed 1/sqrt(D) constant multiplier because
-        # it's exact regardless of what the conv weights converge to during
-        # training — a fixed constant is only an approximation, and gets
-        # worse if a nonlinearity after the norm distorts the distribution,
-        # as happens in cls_proj below.)
         self.norm = nn.LayerNorm(32 * 7 * 7)
 
     @property
@@ -153,26 +90,78 @@ class SpatialCompressionHead(nn.Module):
         return 32 * 7 * 7  # 1568
 
     def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            patch_tokens: (B, num_patches, C) where num_patches == grid_size**2.
-        Returns:
-            (B, output_dim) flattened spatial feature vector, L2-normalised
-            to unit norm (matching the goal branch's scale exactly).
-        """
         B, num_patches, C = patch_tokens.shape
         g = self.grid_size
-        if num_patches != g * g:
-            raise ValueError(
-                f"SpatialCompressionHead expected {g * g} patches "
-                f"(grid_size={g}), got {num_patches}"
-            )
-        x = patch_tokens.view(B, g, g, C).permute(0, 3, 1, 2).contiguous()  # (B, C, g, g)
-        x = self.conv(x)                    # (B, 32, 7, 7)
-        x = x.flatten(start_dim=1)          # (B, 1568)
-        x = self.norm(x)                    # unit per-element variance (training stability)
-        x = F.normalize(x, p=2, dim=-1)     # exact unit L2 norm (scale parity with goal)
+        x = patch_tokens.view(B, g, g, C).permute(0, 3, 1, 2).contiguous()
+        x = self.conv(x)
+        x = x.flatten(start_dim=1)
+        x = self.norm(x)
+        x = F.normalize(x, p=2, dim=-1)
         return x
+
+
+class EpisodicMemory(nn.Module):
+    """
+    Single-head cross-attention over a circular buffer of past CLS tokens.
+
+    Query: current CLS token (projected)
+    Keys/Values: past CLS tokens from buffer (projected)
+    Output: 128-dim memory context vector
+
+    The buffer contents are detached (no BPTT through time). Only the
+    Q/K/V projections and output projection are trainable.
+    """
+
+    def __init__(
+        self,
+        cls_dim: int = 768,
+        memory_proj_dim: int = 128,
+        num_heads: int = 1,
+    ) -> None:
+        super().__init__()
+        self.cls_dim = cls_dim
+        self.memory_proj_dim = memory_proj_dim
+        self.head_dim = memory_proj_dim // num_heads
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(cls_dim, memory_proj_dim)
+        self.k_proj = nn.Linear(cls_dim, memory_proj_dim)
+        self.v_proj = nn.Linear(cls_dim, memory_proj_dim)
+        self.out_proj = nn.Linear(memory_proj_dim, memory_proj_dim)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory_keys: torch.Tensor,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            query:       (B, cls_dim) — current CLS token.
+            memory_keys: (B, M, cls_dim) — past CLS tokens in buffer.
+            memory_mask: (B, M) bool — True where buffer slot is valid.
+
+        Returns:
+            (B, memory_proj_dim) — memory readout vector.
+        """
+        B, M, _ = memory_keys.shape
+
+        q = self.q_proj(query).unsqueeze(1)        # (B, 1, proj_dim)
+        k = self.k_proj(memory_keys)               # (B, M, proj_dim)
+        v = self.v_proj(memory_keys)               # (B, M, proj_dim)
+
+        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, 1, M)
+
+        if memory_mask is not None:
+            attn = attn.masked_fill(~memory_mask.unsqueeze(1), float("-inf"))
+
+        attn = F.softmax(attn, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)    # handle all-masked case
+
+        out = torch.bmm(attn, v).squeeze(1)        # (B, proj_dim)
+        out = self.out_proj(out)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -181,29 +170,7 @@ class SpatialCompressionHead(nn.Module):
 
 class GRUActorCritic(nn.Module):
     """
-    Single-layer GRU Actor-Critic policy for discrete-action navigation.
-
-    Supports two observation encoder modes:
-        - "dino": DINOv2 spatial (patch tokens → SpatialCompressionHead) + CLS projection
-        - "clip": CLIP CLS observation embedding → trainable linear projection
-
-    The goal branch (CLIP 512-dim) is shared across both modes.
-
-    Args:
-        obs_encoder_type:  "dino" or "clip". Default "dino".
-        dino_patch_dim:    Per-patch DINOv2 token width. Default 768.
-        dino_grid_size:    Side length of the DINOv2 patch grid. Default 16.
-        dino_cls_dim:      DINOv2 CLS token width. Default 768.
-        clip_obs_dim:      CLIP obs embedding width. Default 512.
-        clip_obs_proj_dim: Projection dim for CLIP obs. Default 512.
-        goal_embed_dim:    CLIP goal embedding width (fed raw, unprojected). Default 512.
-        cls_proj_dim:      CLS projection output width (dino mode). Default 64.
-        use_cls:           If False, the CLS branch is dropped (dino mode). Default True.
-        hidden_size:       GRU hidden state size. Default 512.
-        num_actions:       Size of the discrete action space. Default 4.
-        num_action_embed:  Dimension of the learned prev-action embedding. Default 32.
-        actor_hidden_dim:  Intermediate linear dim in actor head. Default 256.
-        critic_hidden_dim: Intermediate linear dim in critic head. Default 256.
+    2-layer GRU Actor-Critic with episodic memory and goal projection.
     """
 
     def __init__(
@@ -215,13 +182,17 @@ class GRUActorCritic(nn.Module):
         clip_obs_dim: int = 512,
         clip_obs_proj_dim: int = 512,
         goal_embed_dim: int = 512,
+        goal_proj_dim: int = 512,
         cls_proj_dim: int = 64,
         use_cls: bool = True,
         hidden_size: int = 512,
+        num_recurrent_layers: int = 2,
         num_actions: int = 4,
         num_action_embed: int = 32,
         pointgoal_input_dim: int = 3,
         pointgoal_embed_dim: int = 32,
+        memory_size: int = 64,
+        memory_proj_dim: int = 128,
         actor_hidden_dim: int = 256,
         critic_hidden_dim: int = 256,
     ) -> None:
@@ -229,18 +200,21 @@ class GRUActorCritic(nn.Module):
 
         self.obs_encoder_type = obs_encoder_type
         self.hidden_size = hidden_size
+        self.num_recurrent_layers = num_recurrent_layers
         self.num_actions = num_actions
         self.use_cls = use_cls
         self.goal_embed_dim = goal_embed_dim
+        self.goal_proj_dim = goal_proj_dim
         self.num_action_embed = num_action_embed
         self.pointgoal_embed_dim = pointgoal_embed_dim
+        self.memory_size = memory_size
+        self.memory_proj_dim = memory_proj_dim
+        self.dino_cls_dim = dino_cls_dim
 
         if obs_encoder_type == "dino":
-            # ---- Spatial branch (trainable) ----
             self.spatial_head = SpatialCompressionHead(
                 in_channels=dino_patch_dim, grid_size=dino_grid_size
             )
-            # ---- CLS branch (trainable, ablatable) ----
             self.cls_proj_dim = cls_proj_dim
             self.cls_proj = LinearNormAct(dino_cls_dim, cls_proj_dim)
 
@@ -257,9 +231,18 @@ class GRUActorCritic(nn.Module):
         else:
             raise ValueError(f"Unknown obs_encoder_type: {obs_encoder_type}")
 
+        # ---- Goal projection (trainable) ----
+        self.goal_proj = LinearNormAct(goal_embed_dim, goal_proj_dim)
+
+        # ---- Episodic memory ----
+        self.episodic_memory = EpisodicMemory(
+            cls_dim=dino_cls_dim if obs_encoder_type == "dino" else clip_obs_dim,
+            memory_proj_dim=memory_proj_dim,
+        )
+
         # ---- Previous-action embedding ----
         self.prev_action_embed = nn.Embedding(
-            num_embeddings=num_actions + 1,    # +1 for start-of-episode padding
+            num_embeddings=num_actions + 1,
             embedding_dim=num_action_embed,
         )
 
@@ -269,20 +252,21 @@ class GRUActorCritic(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # ---- Fused input dim ----
-        self.policy_input_dim = (
+        # ---- Fused input dim (without memory — memory added per-step in loop) ----
+        self._base_input_dim = (
             obs_dim
-            + goal_embed_dim
+            + goal_proj_dim
             + num_action_embed
             + pointgoal_embed_dim
         )
+        self.policy_input_dim = self._base_input_dim + memory_proj_dim
 
-        # ---- GRU ----
+        # ---- 2-layer GRU ----
         self.gru = nn.GRU(
             input_size=self.policy_input_dim,
             hidden_size=hidden_size,
-            num_layers=1,
-            batch_first=False,   # (seq_len, batch, features)
+            num_layers=num_recurrent_layers,
+            batch_first=False,
         )
 
         # ---- Actor head ----
@@ -297,18 +281,19 @@ class GRUActorCritic(nn.Module):
             nn.Linear(critic_hidden_dim, 1),
         )
 
-        # Weight initialisation
         self._init_weights()
 
         logger.info(
-            f"GRUActorCritic [{obs_encoder_type}] — policy_input_dim={self.policy_input_dim} "
-            f"(obs={obs_dim}, goal={goal_embed_dim}, "
+            f"GRUActorCritic [{obs_encoder_type}] — "
+            f"policy_input_dim={self.policy_input_dim} "
+            f"(obs={obs_dim}, goal_proj={goal_proj_dim}, "
+            f"memory={memory_proj_dim}, "
             f"prev_action={num_action_embed}, pointgoal={pointgoal_embed_dim}), "
-            f"hidden={hidden_size}, actions={num_actions}"
+            f"GRU={num_recurrent_layers}x{hidden_size}, actions={num_actions}"
         )
 
     # ------------------------------------------------------------------
-    # Weight initialisation (orthogonal is standard for RL)
+    # Weight initialisation
     # ------------------------------------------------------------------
 
     def _init_weights(self) -> None:
@@ -340,16 +325,26 @@ class GRUActorCritic(nn.Module):
                     nn.init.orthogonal_(m.weight)
                     nn.init.zeros_(m.bias)
 
+        for m in self.goal_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
         for m in self.pointgoal_proj.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight)
                 nn.init.zeros_(m.bias)
 
+        for m in self.episodic_memory.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
     # ------------------------------------------------------------------
-    # Fusion helper
+    # Base fusion (everything except memory — computed for all steps at once)
     # ------------------------------------------------------------------
 
-    def _fuse_inputs(
+    def _fuse_base_inputs(
         self,
         patch_embeds: torch.Tensor,
         cls_embed: torch.Tensor,
@@ -358,43 +353,36 @@ class GRUActorCritic(nn.Module):
         pointgoal: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Build the flat fused input vector for a batch of timesteps.
-
-        Args:
-            patch_embeds: (B, 256, 768) — DINOv2 patch tokens (dino mode),
-                          or None (clip mode).
-            cls_embed:    (B, 768) — DINOv2 CLS token (dino mode),
-                          or (B, 512) — CLIP obs embedding (clip mode).
-            goal_embed:   (B, 512) — CLIP goal embedding (raw, unprojected).
-            prev_actions: (B,) long — index of the action taken last step.
-            pointgoal:    (B, 3) — [geodesic_dist, cos(angle), sin(angle)].
+        Build the base fused input (without memory) for all timesteps.
 
         Returns:
-            (B, policy_input_dim)
+            (B, base_input_dim)
         """
-        prev_act_embed = self.prev_action_embed(prev_actions)   # (B, 32)
-        pointgoal_feat = self.pointgoal_proj(pointgoal)         # (B, 32)
+        prev_act_embed = self.prev_action_embed(prev_actions)
+        pointgoal_feat = self.pointgoal_proj(pointgoal)
+        goal_feat = self.goal_proj(goal_embed)
+        goal_feat = F.normalize(goal_feat, p=2, dim=-1)
 
         if self.obs_encoder_type == "dino":
-            spatial_feat = self.spatial_head(patch_embeds)       # (B, 1568)
+            spatial_feat = self.spatial_head(patch_embeds)
             parts = [spatial_feat]
             if self.use_cls:
-                cls_feat = self.cls_proj(cls_embed)              # (B, 64)
+                cls_feat = self.cls_proj(cls_embed)
                 cls_feat = F.normalize(cls_feat, p=2, dim=-1)
                 parts.append(cls_feat)
         else:
-            obs_feat = self.obs_proj(cls_embed)                  # (B, clip_obs_proj_dim)
+            obs_feat = self.obs_proj(cls_embed)
             obs_feat = F.normalize(obs_feat, p=2, dim=-1)
             parts = [obs_feat]
 
-        parts.append(goal_embed)                                # (B, 512)
-        parts.append(prev_act_embed)                            # (B, 32)
-        parts.append(pointgoal_feat)                            # (B, 32)
+        parts.append(goal_feat)
+        parts.append(prev_act_embed)
+        parts.append(pointgoal_feat)
 
         return torch.cat(parts, dim=-1)
 
     # ------------------------------------------------------------------
-    # Core forward (used internally)
+    # Core forward with episodic memory in recurrent loop
     # ------------------------------------------------------------------
 
     def forward(
@@ -406,58 +394,112 @@ class GRUActorCritic(nn.Module):
         hidden: torch.Tensor,
         masks: torch.Tensor,
         pointgoal: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        memory_buffer: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Full forward pass through the spatial-compression head, CLS
-        projection, and GRU policy.
+        Full forward pass with episodic memory built within the recurrent loop.
 
         Args:
-            patch_embeds: (N, 256, 768) — DINOv2 patch tokens.
-            cls_embed:    (N, 768)      — DINOv2 CLS token.
-            goal_embed:   (N, 512)      — CLIP goal embedding.
-            prev_actions: (N,)  long — index of the action taken last step.
-                          Use index `num_actions` for the very first step.
-            hidden:       (1, N, hidden_size) — GRU hidden state.
-            masks:        (N, 1) float — 0.0 at episode boundaries (resets h),
-                          1.0 otherwise.
-            pointgoal:    (N, 3)        — [geodesic_dist, cos(angle), sin(angle)].
+            patch_embeds: (total_B, 256, 768)
+            cls_embed:    (total_B, 768)
+            goal_embed:   (total_B, 512)
+            prev_actions: (total_B,) long
+            hidden:       (num_layers, num_chunks, hidden_size)
+            masks:        (total_B, 1)
+            pointgoal:    (total_B, 3)
+            memory_buffer: (num_chunks, memory_size, cls_dim) — pre-filled
+                           buffer from before this chunk. None = empty.
+            memory_mask:   (num_chunks, memory_size) bool — valid slots.
 
         Returns:
-            logits:     (N, num_actions) — raw action scores (pre-softmax).
-            value:      (N, 1)          — state-value estimate.
-            hidden_out: (1, N, hidden_size) — updated GRU hidden state.
+            logits:         (total_B, num_actions)
+            value:          (total_B, 1)
+            hidden_out:     (num_layers, num_chunks, hidden_size)
+            memory_buf_out: (num_chunks, memory_size, cls_dim) — updated buffer
+            memory_mask_out:(num_chunks, memory_size) — updated mask
         """
-        total_B    = cls_embed.shape[0]       # N during rollout, chunk_len*num_chunks during update
-        num_chunks = hidden.shape[1]         # hidden: (1, num_chunks, hidden_size)
-        chunk_len  = total_B // num_chunks   # 1 during rollout, >1 during PPO update
+        total_B = cls_embed.shape[0]
+        num_chunks = hidden.shape[1]
+        chunk_len = total_B // num_chunks
+        cls_dim = cls_embed.shape[-1]
 
-        # 1. Fuse all branches: (total_B, policy_input_dim)
-        x = self._fuse_inputs(patch_embeds, cls_embed, goal_embed, prev_actions, pointgoal)
+        # 1. Compute base features for all steps at once
+        base_feat = self._fuse_base_inputs(
+            patch_embeds, cls_embed, goal_embed, prev_actions, pointgoal
+        )
+        base_feat = base_feat.view(chunk_len, num_chunks, -1)
 
-        # 2. Reshape to time-major: (chunk_len, num_chunks, features)
-        x = x.view(chunk_len, num_chunks, -1)
+        # Reshape CLS for per-step memory operations
+        cls_seq = cls_embed.view(chunk_len, num_chunks, cls_dim)
         masks_seq = masks.view(chunk_len, num_chunks, 1)
 
-        # 3. Step through the chunk manually, resetting hidden state at
-        #    episode boundaries (mask == 0) at each timestep.
+        # 2. Initialize memory buffer if not provided
+        if memory_buffer is None:
+            memory_buffer = torch.zeros(
+                num_chunks, self.memory_size, cls_dim,
+                device=cls_embed.device, dtype=cls_embed.dtype,
+            )
+            memory_mask = torch.zeros(
+                num_chunks, self.memory_size,
+                device=cls_embed.device, dtype=torch.bool,
+            )
+        # Track write position in circular buffer
+        write_pos = memory_mask.sum(dim=1).clamp(max=self.memory_size - 1).long()
+
+        # 3. Step through time with memory
         h = hidden
         outputs = []
         for t in range(chunk_len):
-            h = h * masks_seq[t].unsqueeze(0)              # (1, num_chunks, hidden_size)
-            out_t, h = self.gru(x[t].unsqueeze(0), h)       # x[t]: (num_chunks, policy_input_dim)
+            # Reset hidden state at episode boundaries
+            # h: (num_layers, num_chunks, hidden_size), mask: (num_chunks, 1)
+            h = h * masks_seq[t].unsqueeze(0).expand_as(h)
+
+            # Reset memory buffer for envs that just started a new episode
+            episode_start = (masks_seq[t].squeeze(-1) == 0)  # (num_chunks,)
+            if episode_start.any():
+                memory_buffer[episode_start] = 0
+                memory_mask[episode_start] = False
+                write_pos[episode_start] = 0
+
+            # Compute memory readout via cross-attention
+            has_memory = memory_mask.any(dim=1)  # (num_chunks,)
+            memory_context = torch.zeros(
+                num_chunks, self.memory_proj_dim,
+                device=cls_embed.device, dtype=cls_embed.dtype,
+            )
+            if has_memory.any():
+                mem_out = self.episodic_memory(
+                    cls_seq[t][has_memory],
+                    memory_buffer[has_memory],
+                    memory_mask[has_memory],
+                )
+                memory_context[has_memory] = mem_out
+
+            # Write current CLS to buffer (detached — no BPTT through time)
+            idx = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, cls_dim)
+            memory_buffer.scatter_(1, idx, cls_seq[t].detach().unsqueeze(1))
+            memory_mask.scatter_(1, write_pos.unsqueeze(1), True)
+            write_pos = (write_pos + 1) % self.memory_size
+
+            # Concatenate base features + memory context
+            x_t = torch.cat([base_feat[t], memory_context], dim=-1)
+
+            # GRU step
+            out_t, h = self.gru(x_t.unsqueeze(0), h)
             outputs.append(out_t.squeeze(0))
 
         gru_out = torch.stack(outputs, dim=0).reshape(total_B, self.hidden_size)
         hidden_out = h
 
         # 4. Actor and Critic heads
-        logits = self.actor(gru_out)      # (total_B, num_actions)
-        value  = self.critic(gru_out)     # (total_B, 1)
+        logits = self.actor(gru_out)
+        value = self.critic(gru_out)
 
-        return logits, value, hidden_out
+        return logits, value, hidden_out, memory_buffer, memory_mask
 
     # ------------------------------------------------------------------
-    # Convenience wrappers used by the PPO trainer
+    # Convenience wrappers
     # ------------------------------------------------------------------
 
     def act(
@@ -469,17 +511,23 @@ class GRUActorCritic(nn.Module):
         hidden: torch.Tensor,
         masks: torch.Tensor,
         pointgoal: torch.Tensor = None,
-        can_stop: Optional[torch.Tensor] = None,   # (N,) bool, True = Stop allowed
-    ) -> Tuple[Categorical, torch.Tensor, torch.Tensor]:
-        logits, value, hidden_out = self.forward(
-            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks, pointgoal
+        can_stop: Optional[torch.Tensor] = None,
+        memory_buffer: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Categorical, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns: (dist, value, hidden_out, memory_buffer_out, memory_mask_out)
+        """
+        logits, value, hidden_out, mem_buf, mem_mask = self.forward(
+            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks,
+            pointgoal, memory_buffer, memory_mask,
         )
         if can_stop is not None:
-            stop_idx = self.num_actions - 1   # Stop is action index 3 (last)
+            stop_idx = self.num_actions - 1
             logits = logits.clone()
             logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
-        return dist, value, hidden_out
+        return dist, value, hidden_out, mem_buf, mem_mask
 
     def evaluate_actions(
         self,
@@ -492,9 +540,17 @@ class GRUActorCritic(nn.Module):
         actions: torch.Tensor,
         pointgoal: torch.Tensor = None,
         can_stop: Optional[torch.Tensor] = None,
+        memory_buffer: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value, _ = self.forward(
-            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks, pointgoal
+        """
+        Re-evaluate actions for PPO update. Memory is built from scratch
+        within each chunk (first steps have limited history, which is
+        acceptable since the GRU hidden state carries longer context).
+        """
+        logits, value, _, _, _ = self.forward(
+            patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks,
+            pointgoal, memory_buffer, memory_mask,
         )
         if can_stop is not None:
             stop_idx = self.num_actions - 1
@@ -502,12 +558,14 @@ class GRUActorCritic(nn.Module):
             logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
-        entropy   = dist.entropy().mean()
+        entropy = dist.entropy().mean()
         return log_probs, value, entropy
 
     def get_initial_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Return a zeroed GRU hidden state for episode start."""
-        return torch.zeros(1, batch_size, self.hidden_size, device=device)
+        """Return zeroed GRU hidden state for episode start."""
+        return torch.zeros(
+            self.num_recurrent_layers, batch_size, self.hidden_size, device=device
+        )
 
     @torch.no_grad()
     def branch_norms(
@@ -516,13 +574,11 @@ class GRUActorCritic(nn.Module):
         cls_embed: torch.Tensor,
         goal_embed: torch.Tensor,
     ) -> dict:
-        """
-        Diagnostic: mean per-sample L2 norm of each fusion branch.
+        """Diagnostic: mean per-sample L2 norm of each fusion branch."""
+        norms = {}
 
-        Returns:
-            dict with branch names → float (batch-mean L2 norm).
-        """
-        norms = {"goal": goal_embed.norm(dim=-1).mean().item()}
+        goal_feat = F.normalize(self.goal_proj(goal_embed), p=2, dim=-1)
+        norms["goal"] = goal_feat.norm(dim=-1).mean().item()
 
         if self.obs_encoder_type == "dino":
             spatial_feat = self.spatial_head(patch_embeds)
@@ -542,17 +598,9 @@ class GRUActorCritic(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
-    """
-    Construct a GRUActorCritic from a Config object.
-
-    Args:
-        cfg:    configs.config.Config instance.
-        device: Device string.
-
-    Returns:
-        GRUActorCritic on the specified device.
-    """
+    """Construct a GRUActorCritic from a Config object."""
     enc = cfg.encoder
+    pol = cfg.policy
     policy = GRUActorCritic(
         obs_encoder_type=getattr(enc, "obs_encoder_type", "dino"),
         dino_patch_dim=getattr(enc, "dino_patch_dim", 768),
@@ -561,14 +609,18 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
         clip_obs_dim=getattr(enc, "goal_embed_dim", 512),
         clip_obs_proj_dim=getattr(enc, "clip_obs_proj_dim", 512),
         goal_embed_dim=getattr(enc, "goal_embed_dim", 512),
+        goal_proj_dim=getattr(enc, "goal_proj_dim", 512),
         cls_proj_dim=getattr(enc, "cls_proj_dim", 64),
         use_cls=getattr(enc, "use_cls", True),
-        hidden_size=cfg.policy.hidden_size,
+        hidden_size=pol.hidden_size,
+        num_recurrent_layers=getattr(pol, "num_recurrent_layers", 2),
         num_actions=cfg.env.num_actions,
         num_action_embed=getattr(enc, "action_embed_dim", 32),
         pointgoal_input_dim=getattr(enc, "pointgoal_input_dim", 3),
         pointgoal_embed_dim=getattr(enc, "pointgoal_embed_dim", 32),
-        actor_hidden_dim=cfg.policy.actor_hidden_dim,
-        critic_hidden_dim=cfg.policy.critic_hidden_dim,
+        memory_size=getattr(enc, "memory_size", 64),
+        memory_proj_dim=getattr(enc, "memory_proj_dim", 128),
+        actor_hidden_dim=pol.actor_hidden_dim,
+        critic_hidden_dim=pol.critic_hidden_dim,
     )
     return policy.to(torch.device(device))
