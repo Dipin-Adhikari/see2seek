@@ -229,10 +229,12 @@ class PPOTrainer:
 
                     # 1c. PointGoal sensor (with dropout for zero-shot transfer)
                     pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
+                    pg_dropped = torch.zeros(pointgoal.shape[0], device=self.device, dtype=torch.bool)
                     if cfg.encoder.pointgoal_dropout > 0.0:
                         drop_mask = (torch.rand(pointgoal.shape[0], 1, device=self.device)
                                      > cfg.encoder.pointgoal_dropout).float()
                         pointgoal = pointgoal * drop_mask
+                        pg_dropped = (drop_mask.squeeze(1) == 0)
 
                     # 1d. Policy forward (with episodic memory)
                     dist, value, hidden_next, memory_buffer, memory_mask = self.policy.act(
@@ -281,6 +283,7 @@ class PPOTrainer:
                     hidden      = hidden,
                     can_stop    = can_stop,
                     pointgoal   = pointgoal,
+                    pointgoal_dropped = pg_dropped,
                 )
 
                 # 1g. Update recurrent state
@@ -364,7 +367,7 @@ class PPOTrainer:
                 # RAW patch/CLS tokens stored in the buffer, so gradients
                 # flow into them here (they were run under no_grad() during
                 # rollout collection).
-                log_probs, values, entropy = self.policy.evaluate_actions(
+                log_probs, values, entropy_per_sample = self.policy.evaluate_actions(
                     patch_embeds = batch.patch_embeds,
                     cls_embed    = batch.cls_embeds,
                     goal_embed   = batch.goal_embeds,
@@ -385,11 +388,20 @@ class PPOTrainer:
                 # Value loss (MSE)
                 value_loss = F.mse_loss(values.squeeze(-1), batch.returns)
 
+                # Per-sample entropy weighting: higher entropy bonus for GPS-off steps
+                entropy_coefs = torch.where(
+                    batch.pointgoal_dropped,
+                    cfg.ppo.entropy_coef_gps_off,
+                    cfg.ppo.entropy_coef_gps_on,
+                )
+                weighted_entropy = (entropy_coefs * entropy_per_sample).mean()
+                entropy = entropy_per_sample.mean()
+
                 # Total loss
                 loss = (
                     policy_loss
                     + cfg.ppo.value_loss_coef * value_loss
-                    - cfg.ppo.entropy_coef    * entropy
+                    - weighted_entropy
                 )
 
                 # Gradient step

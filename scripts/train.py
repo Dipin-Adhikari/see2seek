@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def setup_logging(debug: bool = False, log_dir: str = "data_dino_v2/logs") -> None:
+def setup_logging(debug: bool = False, log_dir: str = "data_dino_v3/logs") -> None:
     level = logging.DEBUG if debug else logging.INFO
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")

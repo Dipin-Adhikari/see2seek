@@ -503,6 +503,9 @@ class RoboTHOREnv:
         self._prev_geodesic_dist = curr_dist
 
         done = self._num_steps >= self.cfg.env.max_steps
+        if done:
+            reward += self.cfg.env.failed_stop_penalty
+
         info = self._build_info(success=False, done=done)
 
         obs = {

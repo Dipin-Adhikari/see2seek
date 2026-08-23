@@ -198,11 +198,11 @@ def plot_metrics(metrics, actions, save_path=None):
 
 
 if __name__ == "__main__":
-    log_dir = Path("data_dino_v2/logs")
+    log_dir = Path("data_dino_v3/logs")
     log_files = sorted(log_dir.glob("train_*.log"))
 
     if not log_files:
-        print("No log files found in data_dino_v2/logs/")
+        print("No log files found in data_dino_v3/logs/")
         sys.exit(1)
 
     print(f"Found {len(log_files)} log file(s), parsing all...")
@@ -216,5 +216,5 @@ if __name__ == "__main__":
     print(f"Steps: {metrics['steps'][0]:,} -> {metrics['steps'][-1]:,}")
     print(f"Latest SR={metrics['SR'][-1]:.3f}  SPL={metrics['SPL'][-1]:.3f}  Reward={metrics['reward'][-1]:.3f}")
 
-    save_path = "data_dino_v2/training_curves.png"
+    save_path = "data_dino_v3/training_curves.png"
     plot_metrics(metrics, actions, save_path=save_path)

@@ -547,6 +547,11 @@ class GRUActorCritic(nn.Module):
         Re-evaluate actions for PPO update. Memory is built from scratch
         within each chunk (first steps have limited history, which is
         acceptable since the GRU hidden state carries longer context).
+
+        Returns:
+            log_probs: (total_B,)
+            value:     (total_B, 1)
+            entropy:   (total_B,) — per-sample entropy (NOT mean)
         """
         logits, value, _, _, _ = self.forward(
             patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks,
@@ -558,7 +563,7 @@ class GRUActorCritic(nn.Module):
             logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
-        entropy = dist.entropy().mean()
+        entropy = dist.entropy()
         return log_probs, value, entropy
 
     def get_initial_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:

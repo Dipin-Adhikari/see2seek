@@ -75,18 +75,19 @@ logger = logging.getLogger(__name__)
 
 class RecurrentBatch(NamedTuple):
     """A single mini-batch fed to policy.evaluate_actions()."""
-    patch_embeds:   torch.Tensor    # (chunk_len * num_chunks, 256, 768)
-    cls_embeds:     torch.Tensor    # (chunk_len * num_chunks, 768)
-    goal_embeds:    torch.Tensor    # (chunk_len * num_chunks, 512)
-    prev_actions:   torch.Tensor    # (chunk_len * num_chunks,)
-    hidden_states:  torch.Tensor    # (num_layers, num_chunks, hidden_size)
-    masks:          torch.Tensor    # (chunk_len * num_chunks, 1)
-    actions:        torch.Tensor    # (chunk_len * num_chunks,)
-    old_log_probs:  torch.Tensor    # (chunk_len * num_chunks,)
-    returns:        torch.Tensor    # (chunk_len * num_chunks,)
-    advantages:     torch.Tensor    # (chunk_len * num_chunks,)
-    can_stop:       torch.Tensor    # (chunk_len * num_chunks,)
-    pointgoals:     torch.Tensor    # (chunk_len * num_chunks, 3)
+    patch_embeds:       torch.Tensor    # (chunk_len * num_chunks, 256, 768)
+    cls_embeds:         torch.Tensor    # (chunk_len * num_chunks, 768)
+    goal_embeds:        torch.Tensor    # (chunk_len * num_chunks, 512)
+    prev_actions:       torch.Tensor    # (chunk_len * num_chunks,)
+    hidden_states:      torch.Tensor    # (num_layers, num_chunks, hidden_size)
+    masks:              torch.Tensor    # (chunk_len * num_chunks, 1)
+    actions:            torch.Tensor    # (chunk_len * num_chunks,)
+    old_log_probs:      torch.Tensor    # (chunk_len * num_chunks,)
+    returns:            torch.Tensor    # (chunk_len * num_chunks,)
+    advantages:         torch.Tensor    # (chunk_len * num_chunks,)
+    can_stop:           torch.Tensor    # (chunk_len * num_chunks,)
+    pointgoals:         torch.Tensor    # (chunk_len * num_chunks, 3)
+    pointgoal_dropped:  torch.Tensor    # (chunk_len * num_chunks,) bool
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +184,7 @@ class RolloutBuffer:
         self.prev_actions = torch.zeros(T, N, dtype=torch.long, device=self.device)
 
         self.can_stop = torch.ones(T, N, dtype=torch.bool, device=self.device)
+        self.pointgoal_dropped = torch.zeros(T, N, dtype=torch.bool, device=self.device)
 
         # Rewards and masks
         # masks[t] = 0 if step t starts a new episode, else 1
@@ -221,6 +223,7 @@ class RolloutBuffer:
         hidden:       torch.Tensor,
         can_stop:     torch.Tensor,
         pointgoal:    torch.Tensor = None,
+        pointgoal_dropped: torch.Tensor = None,
     ) -> None:
         """
         Insert one time-step of data from all environments.
@@ -236,9 +239,10 @@ class RolloutBuffer:
             mask:        (N,) — 0.0 at episode start, 1.0 otherwise
             value:       (N,) or (N,1)
             log_prob:    (N,)
-            hidden:      (1, N, hidden_size) — hidden state BEFORE this step
+            hidden:      (num_layers, N, hidden_size) — hidden state BEFORE this step
             can_stop:    (N,) bool
             pointgoal:   (N, 3) — [geodesic_dist, cos(angle), sin(angle)]
+            pointgoal_dropped: (N,) bool — True if pointgoal was zeroed this step
         """
         t = self._step
 
@@ -262,6 +266,8 @@ class RolloutBuffer:
         self.can_stop[t]         = can_stop
         if pointgoal is not None:
             self.pointgoals[t] = pointgoal.detach().to(device=self.device)
+        if pointgoal_dropped is not None:
+            self.pointgoal_dropped[t] = pointgoal_dropped
 
         self._step += 1
 
@@ -396,6 +402,7 @@ class RolloutBuffer:
         act_list, lp_list, ret_list, adv_list = [], [], [], []
         can_stop_list = []
         pointgoal_list = []
+        pg_dropped_list = []
 
         for local_t in range(chunk_len):
             t_idx_storage = (start_steps_storage + local_t).clamp(max=self.num_steps - 1)
@@ -414,6 +421,7 @@ class RolloutBuffer:
             adv_list.append(self.advantages[t_idx, env_ids])
             can_stop_list.append(self.can_stop[t_idx, env_ids])
             pointgoal_list.append(self.pointgoals[t_idx, env_ids])
+            pg_dropped_list.append(self.pointgoal_dropped[t_idx, env_ids])
 
         # Stack along time dimension: (chunk_len, num_chunks, ...) → flatten time
         def _flat(lst):
@@ -437,18 +445,19 @@ class RolloutBuffer:
         ], dim=0)   # (num_layers, num_chunks, D_h)
 
         return RecurrentBatch(
-            patch_embeds  = patch_batch,
-            cls_embeds    = cls_batch,
-            goal_embeds   = goal_batch,
-            prev_actions  = _flat(prev_act_list),
-            hidden_states = hidden_batch,
-            masks         = _flat(mask_list),
-            actions       = _flat(act_list),
-            old_log_probs = _flat(lp_list),
-            returns       = _flat(ret_list),
-            advantages    = _flat(adv_list),
-            can_stop      = _flat(can_stop_list),
-            pointgoals    = _flat(pointgoal_list),
+            patch_embeds      = patch_batch,
+            cls_embeds        = cls_batch,
+            goal_embeds       = goal_batch,
+            prev_actions      = _flat(prev_act_list),
+            hidden_states     = hidden_batch,
+            masks             = _flat(mask_list),
+            actions           = _flat(act_list),
+            old_log_probs     = _flat(lp_list),
+            returns           = _flat(ret_list),
+            advantages        = _flat(adv_list),
+            can_stop          = _flat(can_stop_list),
+            pointgoals        = _flat(pointgoal_list),
+            pointgoal_dropped = _flat(pg_dropped_list),
         )
 
     # ------------------------------------------------------------------
