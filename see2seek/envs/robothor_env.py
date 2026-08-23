@@ -170,6 +170,9 @@ class RoboTHOREnv:
         self._num_steps: int = 0
         self._episode_collisions: int = 0
 
+        # Curriculum: effective max_steps (updated by trainer)
+        self._effective_max_steps: int = cfg.env.max_steps
+
         # Lazy-initialise AI2-THOR backend controller
         self._controller = None
         self._init_controller()
@@ -450,8 +453,16 @@ class RoboTHOREnv:
 
         try:
             if action_name == "Stop":
-                done, success = self._handle_stop()
-                reward = self.cfg.env.success_reward if success else self.cfg.env.failed_stop_penalty
+                done, success, stop_dist = self._handle_stop()
+                if success:
+                    reward = self.cfg.env.success_reward
+                elif self.cfg.env.shaped_stop:
+                    # Shaped penalty: closer stops are less punished.
+                    # At success_distance: 0 penalty. At 5m+: full penalty.
+                    ratio = min((stop_dist - self.cfg.env.success_distance) / 4.0, 1.0)
+                    reward = self.cfg.env.failed_stop_penalty * ratio
+                else:
+                    reward = self.cfg.env.failed_stop_penalty
                 info = self._build_info(success, done)
                 obs = {
                     "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
@@ -502,7 +513,7 @@ class RoboTHOREnv:
 
         self._prev_geodesic_dist = curr_dist
 
-        done = self._num_steps >= self.cfg.env.max_steps
+        done = self._num_steps >= self._effective_max_steps
         if done:
             reward += self.cfg.env.failed_stop_penalty
 
@@ -576,17 +587,17 @@ class RoboTHOREnv:
     # =======================================================================
     # Internal Pipeline Helper Functions
     # =======================================================================
-    def _handle_stop(self) -> Tuple[bool, bool]:
+    def _handle_stop(self) -> Tuple[bool, bool, float]:
         """Validates stopping threshold distance criteria against the final target path node."""
         goal_pos = self._current_episode["shortest_path"][-1]
         agent_pos = self._controller.last_event.metadata["agent"]["position"]
 
-        dist = np.linalg.norm([
+        dist = float(np.linalg.norm([
             agent_pos["x"] - goal_pos["x"],
             agent_pos["z"] - goal_pos["z"],
-        ])
+        ]))
         success = dist <= self.cfg.env.success_distance
-        return True, success
+        return True, success, dist
 
     def _compute_pointgoal(self) -> torch.Tensor:
         """
@@ -732,6 +743,10 @@ class RoboTHOREnv:
             "scene_id": self._current_episode.get("scene", "?"),
             "collisions": self._episode_collisions,
         }
+
+    def set_max_steps(self, max_steps: int) -> None:
+        """Update effective max_steps (called by trainer for curriculum scheduling)."""
+        self._effective_max_steps = max_steps
 
     # =======================================================================
     # Environment Class Attribute Space Properties

@@ -78,6 +78,7 @@ class RecurrentBatch(NamedTuple):
     patch_embeds:       torch.Tensor    # (chunk_len * num_chunks, 256, 768)
     cls_embeds:         torch.Tensor    # (chunk_len * num_chunks, 768)
     goal_embeds:        torch.Tensor    # (chunk_len * num_chunks, 512)
+    poses:              torch.Tensor    # (chunk_len * num_chunks, 4)
     prev_actions:       torch.Tensor    # (chunk_len * num_chunks,)
     hidden_states:      torch.Tensor    # (num_layers, num_chunks, hidden_size)
     masks:              torch.Tensor    # (chunk_len * num_chunks, 1)
@@ -179,6 +180,9 @@ class RolloutBuffer:
         # PointGoal sensor (small — always on compute device, fp32)
         self.pointgoals = torch.zeros(T, N, self.pointgoal_dim, device=self.device)
 
+        # Dead-reckoned poses: [x, y, cos_theta, sin_theta] per step
+        self.poses = torch.zeros(T, N, 4, device=self.device)
+
         # Actions
         self.actions      = torch.zeros(T, N, dtype=torch.long, device=self.device)
         self.prev_actions = torch.zeros(T, N, dtype=torch.long, device=self.device)
@@ -224,6 +228,7 @@ class RolloutBuffer:
         can_stop:     torch.Tensor,
         pointgoal:    torch.Tensor = None,
         pointgoal_dropped: torch.Tensor = None,
+        pose:         torch.Tensor = None,
     ) -> None:
         """
         Insert one time-step of data from all environments.
@@ -268,6 +273,8 @@ class RolloutBuffer:
             self.pointgoals[t] = pointgoal.detach().to(device=self.device)
         if pointgoal_dropped is not None:
             self.pointgoal_dropped[t] = pointgoal_dropped
+        if pose is not None:
+            self.poses[t] = pose.detach().to(device=self.device)
 
         self._step += 1
 
@@ -403,6 +410,7 @@ class RolloutBuffer:
         can_stop_list = []
         pointgoal_list = []
         pg_dropped_list = []
+        pose_list = []
 
         for local_t in range(chunk_len):
             t_idx_storage = (start_steps_storage + local_t).clamp(max=self.num_steps - 1)
@@ -422,6 +430,7 @@ class RolloutBuffer:
             can_stop_list.append(self.can_stop[t_idx, env_ids])
             pointgoal_list.append(self.pointgoals[t_idx, env_ids])
             pg_dropped_list.append(self.pointgoal_dropped[t_idx, env_ids])
+            pose_list.append(self.poses[t_idx, env_ids])
 
         # Stack along time dimension: (chunk_len, num_chunks, ...) → flatten time
         def _flat(lst):
@@ -448,6 +457,7 @@ class RolloutBuffer:
             patch_embeds      = patch_batch,
             cls_embeds        = cls_batch,
             goal_embeds       = goal_batch,
+            poses             = _flat(pose_list),
             prev_actions      = _flat(prev_act_list),
             hidden_states     = hidden_batch,
             masks             = _flat(mask_list),

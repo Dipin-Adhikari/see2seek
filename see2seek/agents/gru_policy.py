@@ -102,54 +102,85 @@ class SpatialCompressionHead(nn.Module):
 
 class EpisodicMemory(nn.Module):
     """
-    Single-head cross-attention over a circular buffer of past CLS tokens.
+    Position-augmented episodic memory via cross-attention.
 
-    Query: current CLS token (projected)
-    Keys/Values: past CLS tokens from buffer (projected)
+    Stores (CLS_token, dead_reckoned_pose) pairs in a circular buffer.
+    Query: current CLS token + current pose (projected)
+    Keys/Values: past CLS tokens + past poses (projected)
     Output: 128-dim memory context vector
 
+    Dead-reckoned pose is (x, y, cos_theta, sin_theta) — 4 values,
+    accumulated from discrete actions. This gives the agent spatial
+    awareness of WHERE it has been, enabling implicit loop detection
+    and frontier-seeking behavior without depth sensors.
+
     The buffer contents are detached (no BPTT through time). Only the
-    Q/K/V projections and output projection are trainable.
+    Q/K/V projections, pose embedding, and output projection are trainable.
     """
+
+    POSE_DIM = 4  # (x, y, cos_theta, sin_theta)
 
     def __init__(
         self,
         cls_dim: int = 768,
         memory_proj_dim: int = 128,
         num_heads: int = 1,
+        pose_embed_dim: int = 32,
     ) -> None:
         super().__init__()
         self.cls_dim = cls_dim
         self.memory_proj_dim = memory_proj_dim
         self.head_dim = memory_proj_dim // num_heads
         self.num_heads = num_heads
+        self.pose_embed_dim = pose_embed_dim
 
-        self.q_proj = nn.Linear(cls_dim, memory_proj_dim)
-        self.k_proj = nn.Linear(cls_dim, memory_proj_dim)
-        self.v_proj = nn.Linear(cls_dim, memory_proj_dim)
+        # Pose embedding: raw 4-dim -> pose_embed_dim
+        self.pose_proj = nn.Sequential(
+            nn.Linear(self.POSE_DIM, pose_embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        kv_input_dim = cls_dim + pose_embed_dim
+        q_input_dim = cls_dim + pose_embed_dim
+
+        self.q_proj = nn.Linear(q_input_dim, memory_proj_dim)
+        self.k_proj = nn.Linear(kv_input_dim, memory_proj_dim)
+        self.v_proj = nn.Linear(kv_input_dim, memory_proj_dim)
         self.out_proj = nn.Linear(memory_proj_dim, memory_proj_dim)
         self.scale = self.head_dim ** -0.5
 
     def forward(
         self,
-        query: torch.Tensor,
-        memory_keys: torch.Tensor,
+        query_cls: torch.Tensor,
+        query_pose: torch.Tensor,
+        memory_cls: torch.Tensor,
+        memory_poses: torch.Tensor,
         memory_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            query:       (B, cls_dim) — current CLS token.
-            memory_keys: (B, M, cls_dim) — past CLS tokens in buffer.
-            memory_mask: (B, M) bool — True where buffer slot is valid.
+            query_cls:    (B, cls_dim) — current CLS token.
+            query_pose:   (B, 4) — current dead-reckoned pose.
+            memory_cls:   (B, M, cls_dim) — past CLS tokens in buffer.
+            memory_poses: (B, M, 4) — past poses in buffer.
+            memory_mask:  (B, M) bool — True where buffer slot is valid.
 
         Returns:
             (B, memory_proj_dim) — memory readout vector.
         """
-        B, M, _ = memory_keys.shape
+        B, M, _ = memory_cls.shape
 
-        q = self.q_proj(query).unsqueeze(1)        # (B, 1, proj_dim)
-        k = self.k_proj(memory_keys)               # (B, M, proj_dim)
-        v = self.v_proj(memory_keys)               # (B, M, proj_dim)
+        # Embed poses
+        q_pose_feat = self.pose_proj(query_pose)               # (B, pose_embed_dim)
+        m_pose_feat = self.pose_proj(memory_poses.reshape(B * M, -1)).view(B, M, -1)
+
+        # Concat cls + pose for Q, K, V
+        q_input = torch.cat([query_cls, q_pose_feat], dim=-1)  # (B, cls+pose)
+        kv_input = torch.cat([memory_cls, m_pose_feat], dim=-1)  # (B, M, cls+pose)
+
+        q = self.q_proj(q_input).unsqueeze(1)      # (B, 1, proj_dim)
+        k = self.k_proj(kv_input)                  # (B, M, proj_dim)
+        v = self.v_proj(kv_input)                  # (B, M, proj_dim)
 
         attn = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, 1, M)
 
@@ -157,7 +188,7 @@ class EpisodicMemory(nn.Module):
             attn = attn.masked_fill(~memory_mask.unsqueeze(1), float("-inf"))
 
         attn = F.softmax(attn, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)    # handle all-masked case
+        attn = torch.nan_to_num(attn, nan=0.0)
 
         out = torch.bmm(attn, v).squeeze(1)        # (B, proj_dim)
         out = self.out_proj(out)
@@ -395,10 +426,12 @@ class GRUActorCritic(nn.Module):
         masks: torch.Tensor,
         pointgoal: torch.Tensor = None,
         memory_buffer: Optional[torch.Tensor] = None,
+        memory_pose_buffer: Optional[torch.Tensor] = None,
         memory_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        poses: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Full forward pass with episodic memory built within the recurrent loop.
+        Full forward pass with position-augmented episodic memory.
 
         Args:
             patch_embeds: (total_B, 256, 768)
@@ -408,16 +441,13 @@ class GRUActorCritic(nn.Module):
             hidden:       (num_layers, num_chunks, hidden_size)
             masks:        (total_B, 1)
             pointgoal:    (total_B, 3)
-            memory_buffer: (num_chunks, memory_size, cls_dim) — pre-filled
-                           buffer from before this chunk. None = empty.
-            memory_mask:   (num_chunks, memory_size) bool — valid slots.
+            memory_buffer:      (num_chunks, memory_size, cls_dim)
+            memory_pose_buffer: (num_chunks, memory_size, 4)
+            memory_mask:        (num_chunks, memory_size) bool
+            poses:        (total_B, 4) — dead-reckoned [x, y, cos_theta, sin_theta]
 
         Returns:
-            logits:         (total_B, num_actions)
-            value:          (total_B, 1)
-            hidden_out:     (num_layers, num_chunks, hidden_size)
-            memory_buf_out: (num_chunks, memory_size, cls_dim) — updated buffer
-            memory_mask_out:(num_chunks, memory_size) — updated mask
+            logits, value, hidden_out, memory_buf_out, memory_pose_buf_out, memory_mask_out
         """
         total_B = cls_embed.shape[0]
         num_chunks = hidden.shape[1]
@@ -430,20 +460,38 @@ class GRUActorCritic(nn.Module):
         )
         base_feat = base_feat.view(chunk_len, num_chunks, -1)
 
-        # Reshape CLS for per-step memory operations
+        # Reshape CLS and poses for per-step memory operations
         cls_seq = cls_embed.view(chunk_len, num_chunks, cls_dim)
         masks_seq = masks.view(chunk_len, num_chunks, 1)
 
-        # 2. Initialize memory buffer if not provided
+        if poses is not None:
+            pose_seq = poses.view(chunk_len, num_chunks, EpisodicMemory.POSE_DIM)
+        else:
+            pose_seq = torch.zeros(
+                chunk_len, num_chunks, EpisodicMemory.POSE_DIM,
+                device=cls_embed.device, dtype=cls_embed.dtype,
+            )
+
+        # 2. Initialize memory buffers if not provided
         if memory_buffer is None:
             memory_buffer = torch.zeros(
                 num_chunks, self.memory_size, cls_dim,
+                device=cls_embed.device, dtype=cls_embed.dtype,
+            )
+            memory_pose_buffer = torch.zeros(
+                num_chunks, self.memory_size, EpisodicMemory.POSE_DIM,
                 device=cls_embed.device, dtype=cls_embed.dtype,
             )
             memory_mask = torch.zeros(
                 num_chunks, self.memory_size,
                 device=cls_embed.device, dtype=torch.bool,
             )
+        elif memory_pose_buffer is None:
+            memory_pose_buffer = torch.zeros(
+                num_chunks, self.memory_size, EpisodicMemory.POSE_DIM,
+                device=cls_embed.device, dtype=cls_embed.dtype,
+            )
+
         # Track write position in circular buffer
         write_pos = memory_mask.sum(dim=1).clamp(max=self.memory_size - 1).long()
 
@@ -452,18 +500,18 @@ class GRUActorCritic(nn.Module):
         outputs = []
         for t in range(chunk_len):
             # Reset hidden state at episode boundaries
-            # h: (num_layers, num_chunks, hidden_size), mask: (num_chunks, 1)
             h = h * masks_seq[t].unsqueeze(0).expand_as(h)
 
             # Reset memory buffer for envs that just started a new episode
-            episode_start = (masks_seq[t].squeeze(-1) == 0)  # (num_chunks,)
+            episode_start = (masks_seq[t].squeeze(-1) == 0)
             if episode_start.any():
                 memory_buffer[episode_start] = 0
+                memory_pose_buffer[episode_start] = 0
                 memory_mask[episode_start] = False
                 write_pos[episode_start] = 0
 
             # Compute memory readout via cross-attention
-            has_memory = memory_mask.any(dim=1)  # (num_chunks,)
+            has_memory = memory_mask.any(dim=1)
             memory_context = torch.zeros(
                 num_chunks, self.memory_proj_dim,
                 device=cls_embed.device, dtype=cls_embed.dtype,
@@ -471,14 +519,20 @@ class GRUActorCritic(nn.Module):
             if has_memory.any():
                 mem_out = self.episodic_memory(
                     cls_seq[t][has_memory],
+                    pose_seq[t][has_memory],
                     memory_buffer[has_memory],
+                    memory_pose_buffer[has_memory],
                     memory_mask[has_memory],
                 )
                 memory_context[has_memory] = mem_out
 
-            # Write current CLS to buffer (detached — no BPTT through time)
-            idx = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, cls_dim)
-            memory_buffer.scatter_(1, idx, cls_seq[t].detach().unsqueeze(1))
+            # Write current CLS + pose to buffer (detached)
+            idx_cls = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, cls_dim)
+            memory_buffer.scatter_(1, idx_cls, cls_seq[t].detach().unsqueeze(1))
+
+            idx_pose = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, EpisodicMemory.POSE_DIM)
+            memory_pose_buffer.scatter_(1, idx_pose, pose_seq[t].detach().unsqueeze(1))
+
             memory_mask.scatter_(1, write_pos.unsqueeze(1), True)
             write_pos = (write_pos + 1) % self.memory_size
 
@@ -496,7 +550,7 @@ class GRUActorCritic(nn.Module):
         logits = self.actor(gru_out)
         value = self.critic(gru_out)
 
-        return logits, value, hidden_out, memory_buffer, memory_mask
+        return logits, value, hidden_out, memory_buffer, memory_pose_buffer, memory_mask
 
     # ------------------------------------------------------------------
     # Convenience wrappers
@@ -513,21 +567,23 @@ class GRUActorCritic(nn.Module):
         pointgoal: torch.Tensor = None,
         can_stop: Optional[torch.Tensor] = None,
         memory_buffer: Optional[torch.Tensor] = None,
+        memory_pose_buffer: Optional[torch.Tensor] = None,
         memory_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[Categorical, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        poses: Optional[torch.Tensor] = None,
+    ) -> Tuple[Categorical, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns: (dist, value, hidden_out, memory_buffer_out, memory_mask_out)
+        Returns: (dist, value, hidden_out, memory_buffer_out, memory_pose_buffer_out, memory_mask_out)
         """
-        logits, value, hidden_out, mem_buf, mem_mask = self.forward(
+        logits, value, hidden_out, mem_buf, mem_pose_buf, mem_mask = self.forward(
             patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks,
-            pointgoal, memory_buffer, memory_mask,
+            pointgoal, memory_buffer, memory_pose_buffer, memory_mask, poses,
         )
         if can_stop is not None:
             stop_idx = self.num_actions - 1
             logits = logits.clone()
             logits[~can_stop, stop_idx] = float("-inf")
         dist = Categorical(logits=logits)
-        return dist, value, hidden_out, mem_buf, mem_mask
+        return dist, value, hidden_out, mem_buf, mem_pose_buf, mem_mask
 
     def evaluate_actions(
         self,
@@ -541,7 +597,9 @@ class GRUActorCritic(nn.Module):
         pointgoal: torch.Tensor = None,
         can_stop: Optional[torch.Tensor] = None,
         memory_buffer: Optional[torch.Tensor] = None,
+        memory_pose_buffer: Optional[torch.Tensor] = None,
         memory_mask: Optional[torch.Tensor] = None,
+        poses: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Re-evaluate actions for PPO update. Memory is built from scratch
@@ -553,9 +611,9 @@ class GRUActorCritic(nn.Module):
             value:     (total_B, 1)
             entropy:   (total_B,) — per-sample entropy (NOT mean)
         """
-        logits, value, _, _, _ = self.forward(
+        logits, value, _, _, _, _ = self.forward(
             patch_embeds, cls_embed, goal_embed, prev_actions, hidden, masks,
-            pointgoal, memory_buffer, memory_mask,
+            pointgoal, memory_buffer, memory_pose_buffer, memory_mask, poses,
         )
         if can_stop is not None:
             stop_idx = self.num_actions - 1

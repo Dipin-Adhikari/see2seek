@@ -198,14 +198,32 @@ def plot_metrics(metrics, actions, save_path=None):
 
 
 if __name__ == "__main__":
-    log_dir = Path("data_dino_v3/logs")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Plot training curves from log files")
+    parser.add_argument("--config", default=None, help="Path to YAML config (uses log_dir from config)")
+    parser.add_argument("--log_dir", default=None, help="Override log directory path")
+    parser.add_argument("--output", default=None, help="Override output image path")
+    args = parser.parse_args()
+
+    if args.log_dir:
+        log_dir = Path(args.log_dir)
+    elif args.config:
+        from see2seek.utils.config import load_config
+        cfg = load_config(args.config)
+        log_dir = Path(cfg.logging.log_dir)
+    else:
+        from see2seek.utils.config import Config
+        cfg = Config()
+        log_dir = Path(cfg.logging.log_dir)
+
     log_files = sorted(log_dir.glob("train_*.log"))
 
     if not log_files:
-        print("No log files found in data_dino_v3/logs/")
+        print(f"No log files found in {log_dir}/")
         sys.exit(1)
 
-    print(f"Found {len(log_files)} log file(s), parsing all...")
+    print(f"Found {len(log_files)} log file(s) in {log_dir}, parsing all...")
     metrics, actions = merge_logs(log_files)
 
     if len(metrics["steps"]) == 0:
@@ -216,5 +234,5 @@ if __name__ == "__main__":
     print(f"Steps: {metrics['steps'][0]:,} -> {metrics['steps'][-1]:,}")
     print(f"Latest SR={metrics['SR'][-1]:.3f}  SPL={metrics['SPL'][-1]:.3f}  Reward={metrics['reward'][-1]:.3f}")
 
-    save_path = "data_dino_v3/training_curves.png"
+    save_path = args.output or str(log_dir / "training_curves.png")
     plot_metrics(metrics, actions, save_path=save_path)

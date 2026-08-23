@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -201,12 +202,30 @@ class PPOTrainer:
         memory_buffer = torch.zeros(
             cfg.env.num_envs, memory_size, cls_dim_for_mem, device=self.device
         )
+        memory_pose_buffer = torch.zeros(
+            cfg.env.num_envs, memory_size, 4, device=self.device
+        )
         memory_mask = torch.zeros(
             cfg.env.num_envs, memory_size, device=self.device, dtype=torch.bool
         )
 
+        # Dead-reckoned pose: [x, y, cos_theta, sin_theta] per env
+        # Accumulated from discrete actions (MoveAhead=0.25m, Rotate=30deg)
+        agent_poses = torch.zeros(cfg.env.num_envs, 4, device=self.device)
+        agent_poses[:, 2] = 1.0  # cos(0) = 1
+        # agent_poses[:, 3] = 0.0  # sin(0) = 0 (already zero)
+
         steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)
         while self._total_steps < cfg.ppo.total_num_steps:
+            # ---- Curriculum: update effective max_steps ----
+            if cfg.env.curriculum_enabled:
+                progress = min(self._total_steps / cfg.env.curriculum_ramp_steps, 1.0)
+                curr_max_steps = int(
+                    cfg.env.curriculum_start_max_steps
+                    + progress * (cfg.env.curriculum_end_max_steps - cfg.env.curriculum_start_max_steps)
+                )
+                self.vec_env.set_max_steps(curr_max_steps)
+
             # ---- Phase 1: Collect rollout ----
             self.policy.eval()    # eval for rollout (no dropout)
             collect_start = time.time()
@@ -236,11 +255,12 @@ class PPOTrainer:
                         pointgoal = pointgoal * drop_mask
                         pg_dropped = (drop_mask.squeeze(1) == 0)
 
-                    # 1d. Policy forward (with episodic memory)
-                    dist, value, hidden_next, memory_buffer, memory_mask = self.policy.act(
+                    # 1d. Policy forward (with position-augmented episodic memory)
+                    dist, value, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                         patch_embed, cls_embed, goal_embed, prev_actions,
                         hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
-                        memory_buffer=memory_buffer, memory_mask=memory_mask,
+                        memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
+                        memory_mask=memory_mask, poses=agent_poses,
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
@@ -248,6 +268,40 @@ class PPOTrainer:
                 # 1d. Step environments
                 obs_dict, rewards, dones, infos = self.vec_env.step(actions)
                 rewards = rewards.to(self.device)
+
+                # Dead-reckon pose update (vectorized)
+                # actions: 0=MoveAhead, 1=RotateLeft, 2=RotateRight, 3=Stop
+                # agent_poses: (N, 4) = [x, y, cos_theta, sin_theta]
+                dones_dev = dones.to(self.device)
+                acts_dev = actions
+
+                # Reset pose for done envs
+                agent_poses[dones_dev] = 0.0
+                agent_poses[dones_dev, 2] = 1.0
+
+                # MoveAhead: x += step*sin_theta, y += step*cos_theta
+                is_move = (acts_dev == 0) & ~dones_dev
+                if is_move.any():
+                    agent_poses[is_move, 0] += cfg.env.move_magnitude * agent_poses[is_move, 3]
+                    agent_poses[is_move, 1] += cfg.env.move_magnitude * agent_poses[is_move, 2]
+
+                # Rotation: apply 2D rotation matrix to (cos_theta, sin_theta)
+                cos_r = math.cos(math.radians(cfg.env.rotate_degrees))
+                sin_r = math.sin(math.radians(cfg.env.rotate_degrees))
+
+                is_left = (acts_dev == 1) & ~dones_dev
+                if is_left.any():
+                    c = agent_poses[is_left, 2].clone()
+                    s = agent_poses[is_left, 3].clone()
+                    agent_poses[is_left, 2] = c * cos_r - s * sin_r
+                    agent_poses[is_left, 3] = s * cos_r + c * sin_r
+
+                is_right = (acts_dev == 2) & ~dones_dev
+                if is_right.any():
+                    c = agent_poses[is_right, 2].clone()
+                    s = agent_poses[is_right, 3].clone()
+                    agent_poses[is_right, 2] = c * cos_r + s * sin_r
+                    agent_poses[is_right, 3] = s * cos_r - c * sin_r
 
                 steps_since_reset = steps_since_reset + 1
                 steps_since_reset = torch.where(
@@ -284,6 +338,7 @@ class PPOTrainer:
                     can_stop    = can_stop,
                     pointgoal   = pointgoal,
                     pointgoal_dropped = pg_dropped,
+                    pose        = agent_poses,
                 )
 
                 # 1g. Update recurrent state
@@ -306,10 +361,11 @@ class PPOTrainer:
                     patch_embed = None
                 goal_embed = self._get_goal_embeddings(obs_dict)
                 pointgoal = obs_dict["pointgoal"].to(self.device)
-                _, last_value, _, memory_buffer, memory_mask = self.policy.act(
+                _, last_value, _, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks,
                     pointgoal=pointgoal,
-                    memory_buffer=memory_buffer, memory_mask=memory_mask,
+                    memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
+                    memory_mask=memory_mask, poses=agent_poses,
                 )
 
                 if self._num_updates % cfg.ppo.log_interval == 0:
@@ -377,6 +433,7 @@ class PPOTrainer:
                     actions      = batch.actions,
                     pointgoal    = batch.pointgoals,
                     can_stop     = batch.can_stop,
+                    poses        = batch.poses,
                 )
 
                 # PPO clipped policy loss
@@ -507,6 +564,16 @@ class PPOTrainer:
         success_rate = sum(self._recent_successes) / len(self._recent_successes) if self._recent_successes else 0.0
         mean_spl     = sum(self._recent_spls)      / len(self._recent_spls)      if self._recent_spls      else 0.0
 
+        # Curriculum max_steps (if enabled)
+        if self.cfg.env.curriculum_enabled:
+            progress = min(self._total_steps / self.cfg.env.curriculum_ramp_steps, 1.0)
+            curr_max_steps = int(
+                self.cfg.env.curriculum_start_max_steps
+                + progress * (self.cfg.env.curriculum_end_max_steps - self.cfg.env.curriculum_start_max_steps)
+            )
+        else:
+            curr_max_steps = self.cfg.env.max_steps
+
         logger.info(
             f"[{self._total_steps:>10,} steps | update {self._num_updates:>5}] "
             f"policy_loss={metrics['policy_loss']:.4f}  "
@@ -515,7 +582,8 @@ class PPOTrainer:
             f"reward={mean_reward:.3f}  "
             f"SR={success_rate:.3f}  "
             f"SPL={mean_spl:.3f}  "
-            f"fps={fps:.0f}"
+            f"fps={fps:.0f}  "
+            f"max_steps={curr_max_steps}"
         )
 
         if self._wandb is not None:

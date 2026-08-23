@@ -16,3 +16,5 @@ wandb
 dataset
 birds_eye_views_with_paths
 logs
+augment_dataset
+.claude

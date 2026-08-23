@@ -1,22 +1,48 @@
+"""
+Cache CLIP goal embeddings for all goal images in the dataset.
+
+Processes images in batches and saves a dict {key: embedding_tensor} to
+embeddings.pt in each split directory. Supports resuming from a partial run.
+
+Usage:
+    python -m see2seek.utils.image2vec
+    python -m see2seek.utils.image2vec --dataset_dir /path/to/dataset --splits train val
+"""
+
+import argparse
 import os
+
 import torch
 from PIL import Image
 from tqdm import tqdm
 
 from see2seek.models.encoders.clip_encoder import CLIPGoalEncoder
 
-DATASET_DIR = "/home/dipin/See2Seek/imagenav_dataset"
-SPLITS = ["train"]
 BATCH_SIZE = 32
-CHECKPOINT_EVERY = 50  # save every 50 batches 
+CHECKPOINT_EVERY = 50
+
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    parser = argparse.ArgumentParser(description="Cache CLIP goal embeddings")
+    parser.add_argument("--dataset_dir", default=None,
+                        help="Path to dataset root (default: from config scene_dataset_path parent)")
+    parser.add_argument("--splits", nargs="+", default=["train"],
+                        help="Splits to process (default: train)")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--device", default=None)
+    args = parser.parse_args()
+
+    if args.dataset_dir is None:
+        from see2seek.utils.config import Config
+        cfg = Config()
+        args.dataset_dir = os.path.dirname(cfg.env.scene_dataset_path)
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Initializing CLIP Goal Encoder on device: {device}")
     clip_encoder = CLIPGoalEncoder(device=device)
 
-    for split in SPLITS:
-        split_dir = os.path.join(DATASET_DIR, split)
+    for split in args.splits:
+        split_dir = os.path.join(args.dataset_dir, split)
         images_dir = os.path.join(split_dir, "images")
 
         if not os.path.exists(images_dir):
@@ -27,7 +53,7 @@ def main():
         image_filenames = [f for f in os.listdir(images_dir) if f.lower().endswith(valid_extensions)]
 
         if not image_filenames:
-            print(f"No images found inside {images_dir}")
+            print(f"No images found in {images_dir}")
             continue
 
         output_pt_path = os.path.join(split_dir, "embeddings.pt")
@@ -50,8 +76,8 @@ def main():
             continue
 
         batch_counter = 0
-        for i in tqdm(range(0, len(remaining), BATCH_SIZE)):
-            batch_files = remaining[i : i + BATCH_SIZE]
+        for i in tqdm(range(0, len(remaining), args.batch_size)):
+            batch_files = remaining[i : i + args.batch_size]
             batch_images = []
             batch_keys = []
 

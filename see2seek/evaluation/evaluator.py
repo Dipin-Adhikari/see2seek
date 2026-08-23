@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import Dict, List, Literal, Optional
@@ -154,9 +155,15 @@ class Evaluator:
         memory_buffer = torch.zeros(
             self.num_envs, memory_size, cls_dim_for_mem, device=self.device
         )
+        memory_pose_buffer = torch.zeros(
+            self.num_envs, memory_size, 4, device=self.device
+        )
         memory_mask = torch.zeros(
             self.num_envs, memory_size, device=self.device, dtype=torch.bool
         )
+        # Dead-reckoned pose for evaluation
+        agent_poses = torch.zeros(self.num_envs, 4, device=self.device)
+        agent_poses[:, 2] = 1.0
 
         episode_count = 0
         total_steps = 0
@@ -182,14 +189,40 @@ class Evaluator:
 
                 can_stop = steps_since_reset >= self.cfg.env.min_steps_before_stop
 
-                dist, _, hidden_next, memory_buffer, memory_mask = self.policy.act(
+                dist, _, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions,
                     hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
-                    memory_buffer=memory_buffer, memory_mask=memory_mask,
+                    memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
+                    memory_mask=memory_mask, poses=agent_poses,
                 )
                 actions = dist.sample()
 
             obs_dict, rewards, dones, infos = vec_env.step(actions)
+
+            # Dead-reckon pose update
+            cos_r = math.cos(math.radians(self.cfg.env.rotate_degrees))
+            sin_r = math.sin(math.radians(self.cfg.env.rotate_degrees))
+            dones_dev = dones.to(self.device)
+
+            agent_poses[dones_dev] = 0.0
+            agent_poses[dones_dev, 2] = 1.0
+
+            is_move = (actions == 0) & ~dones_dev
+            if is_move.any():
+                agent_poses[is_move, 0] += self.cfg.env.move_magnitude * agent_poses[is_move, 3]
+                agent_poses[is_move, 1] += self.cfg.env.move_magnitude * agent_poses[is_move, 2]
+            is_left = (actions == 1) & ~dones_dev
+            if is_left.any():
+                c = agent_poses[is_left, 2].clone()
+                s = agent_poses[is_left, 3].clone()
+                agent_poses[is_left, 2] = c * cos_r - s * sin_r
+                agent_poses[is_left, 3] = s * cos_r + c * sin_r
+            is_right = (actions == 2) & ~dones_dev
+            if is_right.any():
+                c = agent_poses[is_right, 2].clone()
+                s = agent_poses[is_right, 3].clone()
+                agent_poses[is_right, 2] = c * cos_r + s * sin_r
+                agent_poses[is_right, 3] = s * cos_r - c * sin_r
 
             steps_since_reset += 1
             total_steps += self.num_envs

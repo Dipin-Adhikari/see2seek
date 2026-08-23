@@ -43,18 +43,18 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    split: str = "train"                    # "train" | "val" | "test"
-    # split: str = "val"
+    # split: str = "train"                    # "train" | "val" | "test"
+    split: str = "val"
 
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
     # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
+    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
+    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
     # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
@@ -75,19 +75,28 @@ class EnvConfig:
 
     # --- Reward shaping ---
     success_reward: float = 10.0
-    failed_stop_penalty: float = -2.0     # penalty for calling Stop when not at goal
-    slack_reward: float = -0.001          # small penalty per step (reduced so exploring isn't punished)
+    failed_stop_penalty: float = -1.0     # max penalty for calling Stop far from goal (shaped)
+    slack_reward: float = -0.01           # per-step cost (encourages efficiency)
     geodesic_reward_scale: float = 2.0    # scale on geodesic-distance delta
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
     collision_penalty: float = -0.01
     rotation_penalty: float = -0.005      # fixed cost per rotation to prevent spinning
+    shaped_stop: bool = True              # if True, failed stop penalty scales with distance
 
     # --- Episode limits ---
     max_steps: int = 500
     min_steps_before_stop: int = 20                # don't allow Stop until this many steps
 
+    # --- Curriculum: max_steps scheduling ---
+    # max_steps ramps up during training to help the agent learn to stop early.
+    # With short episodes, the timeout penalty has strong GAE signal.
+    curriculum_enabled: bool = True
+    curriculum_start_max_steps: int = 150           # max_steps at start of training
+    curriculum_end_max_steps: int = 500             # max_steps at end of curriculum
+    curriculum_ramp_steps: int = 2_000_000          # env steps over which to ramp
+
     # --- Parallelism ---
-    num_envs: int = 16                    # number of parallel rollout workers
+    num_envs: int = 1                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------

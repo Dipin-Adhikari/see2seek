@@ -146,11 +146,29 @@ def plot_evaluation(episodes, save_path=None):
 
 
 if __name__ == "__main__":
-    log_dir = Path("data_new/eval_logs")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Plot evaluation metrics from eval log files")
+    parser.add_argument("--config", default=None, help="Path to YAML config (uses log_dir from config)")
+    parser.add_argument("--log_dir", default=None, help="Override eval log directory path")
+    parser.add_argument("--output", default=None, help="Override output image path")
+    args = parser.parse_args()
+
+    if args.log_dir:
+        log_dir = Path(args.log_dir)
+    elif args.config:
+        from see2seek.utils.config import load_config
+        cfg = load_config(args.config)
+        log_dir = Path(cfg.logging.log_dir)
+    else:
+        from see2seek.utils.config import Config
+        cfg = Config()
+        log_dir = Path(cfg.logging.log_dir)
+
     log_files = sorted(log_dir.glob("eval_*.log"))
 
     if not log_files:
-        print("No eval log files found in data_new/eval_logs/")
+        print(f"No eval log files found in {log_dir}/")
         sys.exit(1)
 
     log_path = log_files[-1]
@@ -169,5 +187,5 @@ if __name__ == "__main__":
     print(f"Mean steps={np.mean([e['steps'] for e in episodes]):.1f}")
     print(f"Mean collisions={np.mean([e['collisions'] for e in episodes]):.1f}")
 
-    save_path = "data_new/eval_curves.png"
+    save_path = args.output or str(log_dir / "eval_curves.png")
     plot_evaluation(episodes, save_path=save_path)

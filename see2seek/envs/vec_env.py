@@ -69,6 +69,10 @@ def _worker(
                 shared_pointgoal.copy_(obs["pointgoal"])
                 conn.send(("ok", reward, done, info))
 
+            elif cmd == "set_max_steps":
+                env.set_max_steps(args[0])
+                conn.send("ok")
+
             elif cmd == "close":
                 env.close()
                 break
@@ -159,6 +163,12 @@ class VecEnv:
         infos   = [r[3] for r in results]
 
         return self._stack_obs(), rewards, dones, infos
+
+    def set_max_steps(self, max_steps: int) -> None:
+        """Update effective max_steps on all worker environments (curriculum)."""
+        for conn in self._parent_conns:
+            conn.send(("set_max_steps", max_steps))
+        self._recv_all()
 
     def close(self) -> None:
         for conn in self._parent_conns:

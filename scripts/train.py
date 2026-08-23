@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def setup_logging(debug: bool = False, log_dir: str = "data_dino_v3/logs") -> None:
+def setup_logging(debug: bool = False, log_dir: str = "logs") -> None:
     level = logging.DEBUG if debug else logging.INFO
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -95,6 +95,19 @@ def main() -> None:
         cfg.logging.use_wandb   = False
         cfg.env.num_envs        = 2
         logger.info("DEBUG MODE: 2 updates, 2 envs, W&B disabled")
+
+    # ---- Re-init logging with config path ----
+    # Reconfigure file handler to use cfg.logging.log_dir
+    log_dir = cfg.logging.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    root_logger = logging.getLogger()
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(name)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"
+    ))
+    root_logger.addHandler(file_handler)
+    logger.info(f"Log file: {log_file}")
 
     # ---- Reproducibility ----
     set_seed(cfg.seed)
