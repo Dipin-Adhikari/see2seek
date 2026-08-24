@@ -96,7 +96,7 @@ class EnvConfig:
     curriculum_ramp_steps: int = 2_000_000          # env steps over which to ramp
 
     # --- Parallelism ---
-    num_envs: int = 1                    # number of parallel rollout workers
+    num_envs: int = 2                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ class LoggingConfig:
     run_name: Optional[str] = None        # None → auto-generated
 
     checkpoint_dir: str = "data_dino_v3/checkpoints"
-    log_dir: str = "logs"
+    log_dir: str = "data_dino_v3/logs"
     video_dir: str = "videos"
 
 

@@ -39,20 +39,15 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def setup_logging(debug: bool = False, log_dir: str = "logs") -> None:
+def setup_logging(debug: bool = False) -> None:
+    """Set up console-only logging. File handler added after config is loaded."""
     level = logging.DEBUG if debug else logging.INFO
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_file),
-        ],
+        handlers=[logging.StreamHandler()],
     )
-    logging.getLogger(__name__).info(f"Logging to {log_file}")
 
 
 def set_seed(seed: int) -> None:
@@ -96,17 +91,15 @@ def main() -> None:
         cfg.env.num_envs        = 2
         logger.info("DEBUG MODE: 2 updates, 2 envs, W&B disabled")
 
-    # ---- Re-init logging with config path ----
-    # Reconfigure file handler to use cfg.logging.log_dir
-    log_dir = cfg.logging.log_dir
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    root_logger = logging.getLogger()
+    # ---- Add file handler to configured log dir ----
+    train_log_dir = os.path.join(cfg.logging.log_dir, "train")
+    os.makedirs(train_log_dir, exist_ok=True)
+    log_file = os.path.join(train_log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(name)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"
     ))
-    root_logger.addHandler(file_handler)
+    logging.getLogger().addHandler(file_handler)
     logger.info(f"Log file: {log_file}")
 
     # ---- Reproducibility ----

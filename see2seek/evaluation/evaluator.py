@@ -109,10 +109,11 @@ class Evaluator:
         """
         # Setup log file
         if log_file is None:
-            os.makedirs(self.cfg.logging.log_dir, exist_ok=True)
+            eval_log_dir = os.path.join(self.cfg.logging.log_dir, "val")
+            os.makedirs(eval_log_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             log_file = os.path.join(
-                self.cfg.logging.log_dir, f"eval_{task}_{split}_{timestamp}.log"
+                eval_log_dir, f"eval_{task}_{split}_{timestamp}.log"
             )
 
         file_handler = logging.FileHandler(log_file)
