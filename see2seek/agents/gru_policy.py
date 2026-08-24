@@ -26,8 +26,12 @@ Architecture (spatial fusion + episodic memory):
 
     6. PointGoal branch: [d,cos,sin] -> Linear/ReLU -> (B, 32)
 
+    7. Ego-pose branch: [x,y,cos_theta,sin_theta] -> Linear/ReLU -> (B, 32)
+       Dead-reckoned position relative to episode start. Gives the agent
+       explicit spatial awareness for loop detection and room escape.
+
     Fusion (flat concat):
-        1568 + 64 + 512 + 128 + 32 + 32 = 2336-dim
+        1568 + 64 + 512 + 128 + 32 + 32 + 32 = 2368-dim
 
     Recurrent policy: 2-layer GRU, hidden_size=512.
 
@@ -222,6 +226,9 @@ class GRUActorCritic(nn.Module):
         num_action_embed: int = 32,
         pointgoal_input_dim: int = 3,
         pointgoal_embed_dim: int = 32,
+        egopose_input_dim: int = 4,
+        egopose_embed_dim: int = 32,
+        use_egopose: bool = True,
         memory_size: int = 64,
         memory_proj_dim: int = 128,
         actor_hidden_dim: int = 256,
@@ -238,6 +245,8 @@ class GRUActorCritic(nn.Module):
         self.goal_proj_dim = goal_proj_dim
         self.num_action_embed = num_action_embed
         self.pointgoal_embed_dim = pointgoal_embed_dim
+        self.egopose_embed_dim = egopose_embed_dim
+        self.use_egopose = use_egopose
         self.memory_size = memory_size
         self.memory_proj_dim = memory_proj_dim
         self.dino_cls_dim = dino_cls_dim
@@ -283,12 +292,20 @@ class GRUActorCritic(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+        # ---- Ego-pose embedding (dead-reckoned position relative to start) ----
+        if use_egopose:
+            self.egopose_proj = nn.Sequential(
+                nn.Linear(egopose_input_dim, egopose_embed_dim),
+                nn.ReLU(inplace=True),
+            )
+
         # ---- Fused input dim (without memory — memory added per-step in loop) ----
         self._base_input_dim = (
             obs_dim
             + goal_proj_dim
             + num_action_embed
             + pointgoal_embed_dim
+            + (egopose_embed_dim if use_egopose else 0)
         )
         self.policy_input_dim = self._base_input_dim + memory_proj_dim
 
@@ -314,12 +331,13 @@ class GRUActorCritic(nn.Module):
 
         self._init_weights()
 
+        egopose_str = f", egopose={egopose_embed_dim}" if use_egopose else ""
         logger.info(
             f"GRUActorCritic [{obs_encoder_type}] — "
             f"policy_input_dim={self.policy_input_dim} "
             f"(obs={obs_dim}, goal_proj={goal_proj_dim}, "
             f"memory={memory_proj_dim}, "
-            f"prev_action={num_action_embed}, pointgoal={pointgoal_embed_dim}), "
+            f"prev_action={num_action_embed}, pointgoal={pointgoal_embed_dim}{egopose_str}), "
             f"GRU={num_recurrent_layers}x{hidden_size}, actions={num_actions}"
         )
 
@@ -366,6 +384,12 @@ class GRUActorCritic(nn.Module):
                 nn.init.orthogonal_(m.weight)
                 nn.init.zeros_(m.bias)
 
+        if self.use_egopose:
+            for m in self.egopose_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight)
+                    nn.init.zeros_(m.bias)
+
         for m in self.episodic_memory.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight)
@@ -382,6 +406,7 @@ class GRUActorCritic(nn.Module):
         goal_embed: torch.Tensor,
         prev_actions: torch.Tensor,
         pointgoal: torch.Tensor,
+        poses: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build the base fused input (without memory) for all timesteps.
@@ -409,6 +434,11 @@ class GRUActorCritic(nn.Module):
         parts.append(goal_feat)
         parts.append(prev_act_embed)
         parts.append(pointgoal_feat)
+
+        # Add ego-pose as direct input (dead-reckoned position relative to start)
+        if self.use_egopose and poses is not None:
+            egopose_feat = self.egopose_proj(poses)
+            parts.append(egopose_feat)
 
         return torch.cat(parts, dim=-1)
 
@@ -456,7 +486,7 @@ class GRUActorCritic(nn.Module):
 
         # 1. Compute base features for all steps at once
         base_feat = self._fuse_base_inputs(
-            patch_embeds, cls_embed, goal_embed, prev_actions, pointgoal
+            patch_embeds, cls_embed, goal_embed, prev_actions, pointgoal, poses
         )
         base_feat = base_feat.view(chunk_len, num_chunks, -1)
 
@@ -681,6 +711,9 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
         num_action_embed=getattr(enc, "action_embed_dim", 32),
         pointgoal_input_dim=getattr(enc, "pointgoal_input_dim", 3),
         pointgoal_embed_dim=getattr(enc, "pointgoal_embed_dim", 32),
+        egopose_input_dim=getattr(enc, "egopose_input_dim", 4),
+        egopose_embed_dim=getattr(enc, "egopose_embed_dim", 32),
+        use_egopose=getattr(enc, "use_egopose", True),
         memory_size=getattr(enc, "memory_size", 64),
         memory_proj_dim=getattr(enc, "memory_proj_dim", 128),
         actor_hidden_dim=pol.actor_hidden_dim,

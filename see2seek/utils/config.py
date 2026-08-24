@@ -43,8 +43,8 @@ class EnvConfig:
 
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
-    # split: str = "train"                    # "train" | "val" | "test"
-    split: str = "val"
+    split: str = "train"                    # "train" | "val" | "test"
+    # split: str = "val"
 
 
     # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
@@ -53,11 +53,14 @@ class EnvConfig:
     # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
     # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
 
-    scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
+    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
+    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
 
     # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
     # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
+
+    scene_dataset_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train"
+    episodes_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -96,7 +99,7 @@ class EnvConfig:
     curriculum_ramp_steps: int = 2_000_000          # env steps over which to ramp
 
     # --- Parallelism ---
-    num_envs: int = 2                    # number of parallel rollout workers
+    num_envs: int = 16                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------
@@ -153,20 +156,26 @@ class EncoderConfig:
     pointgoal_embed_dim: int = 32          # projected dim of pointgoal sensor
     pointgoal_dropout: float = 0.5         # probability of zeroing pointgoal (for ObjectNav transfer)
 
+    # --- Ego-pose sensor embedding (dead-reckoned position relative to start) ---
+    egopose_input_dim: int = 4             # [x, y, cos(theta), sin(theta)]
+    egopose_embed_dim: int = 32            # projected dim of ego-pose sensor
+    use_egopose: bool = True               # whether to include ego-pose as direct GRU input
+
     # --- CLIP obs encoder settings (used when obs_encoder_type == "clip") ---
     clip_obs_proj_dim: int = 512           # projection dim for CLIP obs embedding
 
     # --- Combined policy input ---
     @property
     def policy_input_dim(self) -> int:
+        egopose_dim = self.egopose_embed_dim if self.use_egopose else 0
         if self.obs_encoder_type == "clip":
             return (self.clip_obs_proj_dim + self.goal_embed_dim
-                    + self.action_embed_dim + self.pointgoal_embed_dim)
+                    + self.action_embed_dim + self.pointgoal_embed_dim + egopose_dim)
         else:
             cls_dim = self.cls_proj_dim if self.use_cls else 0
             return (self.spatial_compressed_dim + cls_dim + self.goal_proj_dim
                     + self.memory_proj_dim
-                    + self.action_embed_dim + self.pointgoal_embed_dim)
+                    + self.action_embed_dim + self.pointgoal_embed_dim + egopose_dim)
 
 
 # ---------------------------------------------------------------------------

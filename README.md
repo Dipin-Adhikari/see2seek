@@ -15,13 +15,14 @@ We compare DINOv2's spatial patch features against CLIP's contrastive features a
 | Spatial | DINOv2 patches (256x768) -> 2-layer CNN | Yes | 1568 |
 | CLS | DINOv2 CLS token (768) -> Linear/LN/ELU | Yes | 64 |
 | Goal | CLIP ViT-B/32 embedding (512) -> Linear/LN/ELU | Yes | 512 |
-| Episodic Memory | Cross-attention over last 64 CLS tokens | Yes | 128 |
+| Episodic Memory | Cross-attention over last 64 CLS tokens + poses | Yes | 128 |
 | Prev Action | Learned embedding of last action | Yes | 32 |
 | PointGoal | [geodesic_dist, cos, sin] -> Linear+ReLU | Yes | 32 |
-| **Total GRU input** | | | **2336** |
+| Ego-Pose | [x, y, cos_theta, sin_theta] -> Linear+ReLU | Yes | 32 |
+| **Total GRU input** | | | **2368** |
 
 **Recurrent core:** 2-layer GRU (512 hidden per layer)
-- Layer 1: perception fusion (compresses 2336 -> 512)
+- Layer 1: perception fusion (compresses 2368 -> 512)
 - Layer 2: temporal reasoning and planning
 
 ### Episodic Memory Module
@@ -72,6 +73,25 @@ The memory buffer resets at episode boundaries. Stored tokens are detached (no B
 
 Used during **ImageNav training/eval** (goal location known). Dropped 50% of training time for zero-shot transfer. For **ObjectNav** testing, zeroed out entirely — the GRU retains learned navigation behaviors from training.
 
+### Ego-Pose Sensor (Dead-Reckoned Position)
+
+```
+  Actions executed since episode start
+            |
+            v
+  +----------------------------+
+  | Dead-reckon pose:          |
+  |  - x, y relative to start  |
+  |  - cos(theta), sin(theta)  |
+  |    (agent heading)         |
+  +----------------------------+
+            |
+            v
+  [ x, y, cos(theta), sin(theta) ]   -->  Linear(4, 32) + ReLU  -->  (32-d)
+```
+
+Provides explicit spatial awareness of the agent's position relative to episode start. Combined with episodic memory, enables loop detection and room escape behavior without depth sensors or explicit mapping. The pose is accumulated from discrete actions (MoveAhead: x += 0.25*sin(θ), y += 0.25*cos(θ); Rotate: update θ by ±30°).
+
 ## Reward Function
 
 ```
@@ -103,11 +123,11 @@ Used during **ImageNav training/eval** (goal location known). Dropped 50% of tra
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `geodesic_reward_scale` | 2.0 | Reward for reducing shortest-path distance to goal |
-| `slack_reward` | -0.001 | Minimal step penalty (does not punish exploration) |
+| `slack_reward` | -0.01 | Per-step cost (encourages efficiency) |
 | `collision_penalty` | -0.01 | Discourages walking into walls |
 | `rotation_penalty` | -0.005 | Fixed cost per rotation (prevents spinning) |
 | `success_reward` | +10.0 | Large bonus for stopping within 1m of goal |
-| `failed_stop_penalty` | -2.0 | Harsh penalty for stopping too far from goal |
+| `failed_stop_penalty` | -1.0 | Max penalty for stopping too far (shaped by distance) |
 | `min_steps_before_stop` | 20 | Stop action masked for first 20 steps |
 
 The asymmetric terminal rewards ensure that exploration is always preferred over premature stopping — even at low success rates, the expected value of exploring dominates early termination.
@@ -122,7 +142,10 @@ python scripts/train.py --obs_encoder dino
 python scripts/train.py --obs_encoder clip
 
 # Resume from checkpoint
-python scripts/train.py --resume data_new/checkpoints/checkpoint_000000100352.pth
+python scripts/train.py --resume data_dino_v3/checkpoints/checkpoint_000000051200.pth
+
+# Debug mode (2 envs, 2 updates, no W&B)
+python scripts/train.py --debug
 ```
 
 ### Training Configuration
@@ -140,16 +163,16 @@ python scripts/train.py --resume data_new/checkpoints/checkpoint_000000100352.pt
 
 ```bash
 # ImageNav evaluation (with GPS)
-python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task imagenav
+python scripts/eval.py --checkpoint data_dino_v3/checkpoints/checkpoint_final.pth --task imagenav
 
 # ImageNav evaluation (visual-only, no GPS)
-python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task imagenav --zero_pointgoal
+python scripts/eval.py --checkpoint data_dino_v3/checkpoints/checkpoint_final.pth --task imagenav --zero_pointgoal
 
 # Zero-shot ObjectNav (text goal, no GPS)
-python scripts/eval.py --checkpoint data_new/checkpoints/checkpoint_final.pth --task objectnav
+python scripts/eval.py --checkpoint data_dino_v3/checkpoints/checkpoint_final.pth --task objectnav
 
 # Evaluate CLIP baseline model
-python scripts/eval.py --checkpoint data_new/checkpoints/clip_checkpoint.pth --obs_encoder clip --task imagenav
+python scripts/eval.py --checkpoint data_dino_v3/checkpoints/clip_checkpoint.pth --obs_encoder clip --task imagenav
 ```
 
 ### Metrics
@@ -157,13 +180,16 @@ python scripts/eval.py --checkpoint data_new/checkpoints/clip_checkpoint.pth --o
 - **SR (Success Rate):** Fraction of episodes where agent stops within 1m of goal
 - **SPL (Success weighted by Path Length):** SR penalized by path inefficiency
 
+
+
 ## Project Structure
 
 ```
 See2Seek/
 ├── scripts/
 │   ├── train.py              # Training entry point
-│   └── eval.py               # Evaluation entry point
+│   ├── eval.py               # Evaluation entry point
+│   └── plot_training.py      # Training curve visualization
 ├── see2seek/
 │   ├── agents/
 │   │   └── gru_policy.py     # 2-layer GRU Actor-Critic + Episodic Memory + SpatialCompressionHead
@@ -180,12 +206,21 @@ See2Seek/
 │   ├── evaluation/
 │   │   └── evaluator.py      # Parallel evaluation loop
 │   └── utils/
-│       └── config.py         # Central configuration
+│       ├── config.py         # Central configuration
+│       └── augment_goal_angles.py  # Multi-angle goal augmentation (optional preprocessing)
 ├── configs/
 │   └── train_robothor.yaml   # YAML config overrides
-└── data_new/
-    ├── checkpoints/          # Saved model weights
-    └── goal_datasets/        # Pre-cached CLIP goal embeddings
+├── dataset/                  # Primary dataset (train/val/debug splits)
+│   ├── train/
+│   │   ├── episodes/         # 120 episode JSON files
+│   │   └── embeddings.pt     # Pre-cached CLIP goal embeddings
+│   └── val/
+│       ├── episodes/         # 15 episode JSON files
+│       └── embeddings.pt
+└── data_dino_v3/             # Training outputs (checkpoints, logs)
+    ├── checkpoints/
+    ├── logs/
+    └── goal_datasets/
 ```
 
 ## Key Design Decisions
