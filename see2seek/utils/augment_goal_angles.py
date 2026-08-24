@@ -9,6 +9,13 @@ Architecture (optimized for i9-14900K + RTX 4090):
     - Workers render frames and return (episode_json, frame_bytes) tuples
     - Main process: CLIP-encodes all frames on GPU, writes embeddings.pt + episodes
 
+CHANGES vs original:
+    - Progress is now reported per-episode (not per-file), via periodic
+      "progress" messages on the queue, so you can see real throughput.
+    - Candidate search is capped (MAX_CANDIDATES_TRIED) instead of trying
+      every reachable position in range, which was the main source of
+      "spinning for a long time with nothing to show for it".
+
 Output:
     - Augmented episode JSON files in output_dir/episodes/
     - embeddings.pt in output_dir/ (same key format the training env expects)
@@ -43,6 +50,16 @@ NUM_ANGLES = 4
 HORIZONS = [15, 30]
 EMBED_BATCH_SIZE = 128
 
+# How many of the closest reachable-position candidates to try per angle
+# before giving up on that angle. Trying *all* candidates (could be 50-200+)
+# is the main reason episodes were taking forever with no visible progress.
+MAX_CANDIDATES_TRIED = 8
+
+# Push a "progress" message to the main process every this-many episodes,
+# so the main process can update a live per-episode progress bar instead
+# of waiting for an entire file to finish.
+PROGRESS_EVERY = 5
+
 
 # ===========================================================================
 # Worker process
@@ -67,19 +84,24 @@ def _worker_init(worker_id: int, num_angles: int):
         width=224,
         height=224,
         fieldOfView=79,
-        port=9200 + worker_id,
     )
 
 
-def _worker_process_file(args_tuple):
+def _worker_process_file(args_tuple, queue=None, worker_id=None):
     """
     Process a single scene file in this worker's AI2-THOR instance.
+
+    Emits periodic ("progress", worker_id, fname, {...}) messages on `queue`
+    (if provided) every PROGRESS_EVERY episodes, plus one final flush at the
+    end of the file so the counts add up exactly.
 
     Returns:
         List of (aug_episode_dict, frame_png_bytes, filename) tuples
     """
     input_path, image_id_start = args_tuple
     global _ctrl, _num_angles
+
+    fname = os.path.basename(input_path)
 
     if input_path.endswith(".gz"):
         with gzip.open(input_path, "rt", encoding="utf-8") as f:
@@ -91,16 +113,39 @@ def _worker_process_file(args_tuple):
     if isinstance(episodes, dict):
         episodes = episodes.get("episodes", [])
 
+    total_eps_in_file = len(episodes)
     angle_offsets = [i * (360.0 / _num_angles) for i in range(_num_angles)]
     results = []
     image_id_counter = image_id_start
     current_scene = None
 
-    for episode in episodes:
+    episodes_since_checkpoint = 0
+    augmented_since_checkpoint = 0
+
+    def _flush_progress(ep_idx):
+        if queue is None:
+            return
+        queue.put((
+            "progress", worker_id, fname,
+            {
+                "episodes_delta": episodes_since_checkpoint,
+                "augmented_delta": augmented_since_checkpoint,
+                "episode_idx": ep_idx + 1,
+                "total_episodes": total_eps_in_file,
+            },
+        ))
+
+    for ep_idx, episode in enumerate(episodes):
         scene_name = episode.get("scene")
         object_type = episode.get("object_type")
 
+        episodes_since_checkpoint += 1
+
         if not episode.get("shortest_path"):
+            if episodes_since_checkpoint >= PROGRESS_EVERY:
+                _flush_progress(ep_idx)
+                episodes_since_checkpoint = 0
+                augmented_since_checkpoint = 0
             continue
 
         # Reset scene if needed
@@ -126,7 +171,6 @@ def _worker_process_file(args_tuple):
                     width=224,
                     height=224,
                     fieldOfView=79,
-                    port=9200 + _worker_id,
                 )
                 current_scene = scene_name
 
@@ -148,6 +192,10 @@ def _worker_process_file(args_tuple):
                     target_obj = obj
 
         if target_obj is None:
+            if episodes_since_checkpoint >= PROGRESS_EVERY:
+                _flush_progress(ep_idx)
+                episodes_since_checkpoint = 0
+                augmented_since_checkpoint = 0
             continue
 
         obj_pos = target_obj["position"]
@@ -156,6 +204,10 @@ def _worker_process_file(args_tuple):
         # Get reachable positions
         event = _ctrl.step(action="GetReachablePositions")
         if not event.metadata["lastActionSuccess"]:
+            if episodes_since_checkpoint >= PROGRESS_EVERY:
+                _flush_progress(ep_idx)
+                episodes_since_checkpoint = 0
+                augmented_since_checkpoint = 0
             continue
 
         reachable = event.metadata["actionReturn"]
@@ -169,7 +221,16 @@ def _worker_process_file(args_tuple):
                 candidates.append((pos, dist))
 
         candidates.sort(key=lambda p: p[1])
+        # Cap how many candidates we're willing to try. The closest ones
+        # almost always work; trying all of them (could be 50-200+) is what
+        # made episodes take forever with nothing to show for it.
+        candidates = candidates[:MAX_CANDIDATES_TRIED]
+
         if not candidates:
+            if episodes_since_checkpoint >= PROGRESS_EVERY:
+                _flush_progress(ep_idx)
+                episodes_since_checkpoint = 0
+                augmented_since_checkpoint = 0
             continue
 
         # Render from each angle
@@ -215,10 +276,20 @@ def _worker_process_file(args_tuple):
 
                             results.append((aug_episode, frame_bytes, filename))
                             image_id_counter += 1
+                            augmented_since_checkpoint += 1
                             found = True
                             break
                     if found:
                         break
+
+        if episodes_since_checkpoint >= PROGRESS_EVERY:
+            _flush_progress(ep_idx)
+            episodes_since_checkpoint = 0
+            augmented_since_checkpoint = 0
+
+    # Final flush for any leftover episodes since the last checkpoint
+    if episodes_since_checkpoint > 0:
+        _flush_progress(total_eps_in_file - 1)
 
     return results
 
@@ -252,12 +323,11 @@ def _worker_main(worker_id, assigned_files, num_angles, queue):
         width=224,
         height=224,
         fieldOfView=79,
-        port=9200 + worker_id,
     )
 
     for file_args in assigned_files:
         try:
-            results = _worker_process_file(file_args)
+            results = _worker_process_file(file_args, queue=queue, worker_id=worker_id)
             fname = os.path.basename(file_args[0])
             queue.put(("results", worker_id, fname, results))
         except Exception as e:
@@ -274,6 +344,23 @@ def _worker_main(worker_id, assigned_files, num_angles, queue):
 # ===========================================================================
 # Main process
 # ===========================================================================
+
+def _count_total_episodes(input_episodes_dir, episode_files):
+    """Pre-scan all files to get a total episode count for the progress bar."""
+    total = 0
+    for fname in episode_files:
+        path = os.path.join(input_episodes_dir, fname)
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt") as f:
+                eps = json.load(f)
+        else:
+            with open(path) as f:
+                eps = json.load(f)
+        if isinstance(eps, dict):
+            eps = eps.get("episodes", [])
+        total += len(eps)
+    return total
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -320,18 +407,7 @@ def main():
     print(f"Hardware: using {args.num_workers} parallel AI2-THOR controllers")
 
     if args.dry_run:
-        total_eps = 0
-        for fname in episode_files:
-            path = os.path.join(input_episodes_dir, fname)
-            if path.endswith(".gz"):
-                with gzip.open(path, "rt") as f:
-                    eps = json.load(f)
-            else:
-                with open(path) as f:
-                    eps = json.load(f)
-            if isinstance(eps, dict):
-                eps = eps.get("episodes", [])
-            total_eps += len(eps)
+        total_eps = _count_total_episodes(input_episodes_dir, episode_files)
         print(f"\n[DRY RUN]")
         print(f"Total source episodes: {total_eps}")
         print(f"Max augmented (x{args.num_angles}): {total_eps * args.num_angles}")
@@ -340,13 +416,17 @@ def main():
         return
 
     # Assign image_id ranges to each file so IDs don't collide across workers
-    # Estimate max episodes per file to allocate non-overlapping ID ranges
     max_per_file = 2000 * args.num_angles  # generous upper bound
     work_items = []
     for i, fname in enumerate(episode_files):
         path = os.path.join(input_episodes_dir, fname)
         id_start = i * max_per_file
         work_items.append((path, id_start))
+
+    # Pre-scan for total episode count so the progress bar has a real total
+    print("\nCounting source episodes for progress bar...")
+    total_source_episodes = _count_total_episodes(input_episodes_dir, episode_files)
+    print(f"Total source episodes: {total_source_episodes}")
 
     # Launch workers
     print(f"\nLaunching {args.num_workers} AI2-THOR workers...")
@@ -394,7 +474,10 @@ def main():
     all_pending_keys: List[str] = []
     file_episodes: Dict[str, list] = {}
 
-    pbar = tqdm(total=len(work_items), desc="Files processed")
+    # Primary progress bar: per-episode, updates live as workers process
+    ep_pbar = tqdm(total=total_source_episodes, desc="Episodes processed", unit="ep")
+    files_done = 0
+    file_pbar = tqdm(total=len(work_items), desc="Files completed", unit="file")
 
     while workers_done < len(processes):
         msg_type, wid, fname, data = result_queue.get()
@@ -402,14 +485,26 @@ def main():
         if msg_type == "done":
             workers_done += 1
             continue
+
         elif msg_type == "error":
-            print(f"\n  Worker {wid} error on {fname}: {data}")
-            pbar.update(1)
+            tqdm.write(f"  Worker {wid} error on {fname}: {data}")
+            files_done += 1
+            file_pbar.update(1)
+            continue
+
+        elif msg_type == "progress":
+            ep_pbar.update(data["episodes_delta"])
+            ep_pbar.set_postfix({
+                "augmented": total_augmented + data["augmented_delta"],
+                "worker": wid,
+                "file": fname[:20],
+            })
             continue
 
         # msg_type == "results"
         results = data
-        pbar.update(1)
+        files_done += 1
+        file_pbar.update(1)
         total_augmented += len(results)
 
         # Collect episodes for this file
@@ -438,7 +533,8 @@ def main():
             all_pending_images = all_pending_images[EMBED_BATCH_SIZE:]
             all_pending_keys = all_pending_keys[EMBED_BATCH_SIZE:]
 
-    pbar.close()
+    ep_pbar.close()
+    file_pbar.close()
 
     # Flush remaining images
     print(f"\nEncoding remaining {len(all_pending_images)} images...")
