@@ -39,9 +39,9 @@ from PIL import Image
 from tqdm import tqdm
 
 NUM_ANGLES = 4
-HORIZONS = [15, 30]
+HORIZONS = [0, 15, 30]
 EMBED_BATCH_SIZE = 128
-ANGLE_TOLERANCE_DEG = 60.0
+MIN_ANGLE_SEPARATION_DEG = 30.0
 
 
 # ===========================================================================
@@ -57,7 +57,7 @@ def _worker_main(worker_id, work_queue, result_queue, num_angles):
 
     ctrl = Controller(
         agentMode="locobot",
-        visibilityDistance=1.5,
+        visibilityDistance=3.0,
         scene="FloorPlan_Train1_1",
         gridSize=0.25,
         rotateStepDegrees=30,
@@ -69,7 +69,6 @@ def _worker_main(worker_id, work_queue, result_queue, num_angles):
         fieldOfView=79,
     )
 
-    angle_offsets = [i * (360.0 / num_angles) for i in range(num_angles)]
     current_scene = None
 
     while True:
@@ -115,7 +114,7 @@ def _worker_main(worker_id, work_queue, result_queue, num_angles):
                             pass
                         ctrl = Controller(
                             agentMode="locobot",
-                            visibilityDistance=1.5,
+                            visibilityDistance=3.0,
                             scene=scene_name,
                             gridSize=0.25,
                             rotateStepDegrees=30,
@@ -158,82 +157,100 @@ def _worker_main(worker_id, work_queue, result_queue, num_angles):
 
                 reachable = event.metadata["actionReturn"]
 
-                # For each candidate, compute its bearing FROM the object
-                # angle = atan2(cand_x - obj_x, cand_z - obj_z)
-                candidates_with_angle = []
+                # Collect candidates in range, sorted by distance (closest first)
+                candidates = []
                 for pos in reachable:
                     dx = pos["x"] - obj_pos["x"]
                     dz = pos["z"] - obj_pos["z"]
                     dist = math.sqrt(dx * dx + dz * dz)
                     if 0.5 <= dist <= 2.5:
                         angle_deg = math.degrees(math.atan2(dx, dz)) % 360
-                        candidates_with_angle.append((pos, dist, angle_deg))
+                        candidates.append((pos, dist, angle_deg))
 
-                if not candidates_with_angle:
+                if not candidates:
                     continue
 
-                # For each desired viewing angle, find the best candidate position
-                for angle_idx, offset in enumerate(angle_offsets):
-                    target_angle = offset
+                candidates.sort(key=lambda c: c[1])
 
-                    # Sort candidates by angular proximity to target_angle
-                    def angle_dist(c):
-                        diff = abs(c[2] - target_angle)
-                        if diff > 180:
-                            diff = 360 - diff
-                        return diff
+                # Phase 1: Find ALL positions where object is visible
+                # Try up to 20 candidates (closest first), collect visible ones
+                visible_views = []  # (pos, angle_deg, horizon, frame)
+                for pos, dist, angle_deg in candidates[:20]:
+                    dx = obj_pos["x"] - pos["x"]
+                    dz = obj_pos["z"] - pos["z"]
+                    face_yaw = math.degrees(math.atan2(dx, dz))
 
-                    nearby = [c for c in candidates_with_angle if angle_dist(c) < ANGLE_TOLERANCE_DEG]
-                    if not nearby:
-                        nearby = sorted(candidates_with_angle, key=angle_dist)[:5]
+                    for horizon in HORIZONS:
+                        event = ctrl.step(
+                            action="TeleportFull",
+                            x=pos["x"], y=pos["y"], z=pos["z"],
+                            rotation=dict(x=0, y=face_yaw, z=0),
+                            horizon=horizon,
+                        )
+                        if not event.metadata.get("lastActionSuccess", False):
+                            continue
 
-                    # Prefer closer positions for cleaner views
-                    nearby.sort(key=lambda c: c[1])
-
-                    found = False
-                    for pos, _, _ in nearby[:8]:
-                        if found:
-                            break
-                        # Always FACE the object from this position
-                        dx = obj_pos["x"] - pos["x"]
-                        dz = obj_pos["z"] - pos["z"]
-                        face_yaw = math.degrees(math.atan2(dx, dz))
-
-                        for horizon in HORIZONS:
-                            event = ctrl.step(
-                                action="TeleportFull",
-                                x=pos["x"], y=pos["y"], z=pos["z"],
-                                rotation=dict(x=0, y=face_yaw, z=0),
-                                horizon=horizon,
-                            )
-                            if not event.metadata.get("lastActionSuccess", False):
-                                continue
-
-                            for obj in event.metadata["objects"]:
-                                if obj["objectId"] == target_id and obj["visible"]:
-                                    pil_img = Image.fromarray(event.frame)
-                                    buf = io.BytesIO()
-                                    pil_img.save(buf, format="PNG")
-                                    frame_bytes = buf.getvalue()
-
-                                    aug_id = f"{episode['id']}_angle{angle_idx}"
-                                    filename = f"id_{image_id_counter:06d}_{scene_name}_{aug_id}_goal.png"
-
-                                    aug_episode = episode.copy()
-                                    aug_episode["id"] = aug_id
-                                    aug_episode["goal_image_path"] = f"../images/{filename}"
-                                    aug_episode["optimal_goal_pose"] = {
-                                        "x": pos["x"], "y": pos["y"], "z": pos["z"],
-                                        "rotation": face_yaw, "horizon": horizon,
-                                    }
-                                    aug_episode["angle_offset"] = offset
-
-                                    results.append((aug_episode, frame_bytes, filename))
-                                    image_id_counter += 1
-                                    found = True
-                                    break
-                            if found:
+                        obj_visible = False
+                        for obj in event.metadata["objects"]:
+                            if obj["objectId"] == target_id and obj["visible"]:
+                                obj_visible = True
                                 break
+
+                        if obj_visible:
+                            visible_views.append((pos, angle_deg, face_yaw, horizon, event.frame))
+                            break  # one horizon per position is enough
+
+                    if len(visible_views) >= num_angles * 2:
+                        break  # enough to select from
+
+                if not visible_views:
+                    continue
+
+                # Phase 2: Greedily pick num_angles most angularly diverse views
+                selected = [visible_views[0]]
+                remaining = visible_views[1:]
+
+                while len(selected) < num_angles and remaining:
+                    best_idx = 0
+                    best_min_sep = -1
+                    for i, view in enumerate(remaining):
+                        # Min angular separation from all already-selected
+                        min_sep = 360.0
+                        for sel in selected:
+                            diff = abs(view[1] - sel[1])
+                            if diff > 180:
+                                diff = 360 - diff
+                            min_sep = min(min_sep, diff)
+                        if min_sep > best_min_sep:
+                            best_min_sep = min_sep
+                            best_idx = i
+                    # Only add if it's at least MIN_ANGLE_SEPARATION apart
+                    if best_min_sep >= MIN_ANGLE_SEPARATION_DEG:
+                        selected.append(remaining.pop(best_idx))
+                    else:
+                        break
+
+                # Phase 3: Generate augmented episodes from selected views
+                for angle_idx, (pos, angle_deg, face_yaw, horizon, frame) in enumerate(selected):
+                    pil_img = Image.fromarray(frame)
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    frame_bytes = buf.getvalue()
+
+                    aug_id = f"{episode['id']}_angle{angle_idx}"
+                    filename = f"id_{image_id_counter:06d}_{scene_name}_{aug_id}_goal.png"
+
+                    aug_episode = episode.copy()
+                    aug_episode["id"] = aug_id
+                    aug_episode["goal_image_path"] = f"../images/{filename}"
+                    aug_episode["optimal_goal_pose"] = {
+                        "x": pos["x"], "y": pos["y"], "z": pos["z"],
+                        "rotation": face_yaw, "horizon": horizon,
+                    }
+                    aug_episode["angle_offset"] = angle_deg
+
+                    results.append((aug_episode, frame_bytes, filename))
+                    image_id_counter += 1
 
                 # Send progress every 10 episodes
                 if episodes_processed % 10 == 0:
@@ -427,10 +444,6 @@ def main():
                 all_pending_images = all_pending_images[EMBED_BATCH_SIZE:]
                 all_pending_keys = all_pending_keys[EMBED_BATCH_SIZE:]
 
-            # Periodic checkpoint save (every 50 files)
-            if files_completed % 50 == 0:
-                torch.save(embedding_dict, embeddings_path)
-                tqdm.write(f"  Checkpoint: {len(embedding_dict)} embeddings saved")
 
     ep_pbar.close()
     file_pbar.close()
