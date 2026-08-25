@@ -554,7 +554,7 @@ class GRUActorCritic(nn.Module):
                     memory_pose_buffer[has_memory],
                     memory_mask[has_memory],
                 )
-                memory_context[has_memory] = mem_out
+                memory_context[has_memory] = F.normalize(mem_out, p=2, dim=-1)
 
             # Write current CLS + pose to buffer (detached)
             idx_cls = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, cls_dim)
@@ -706,6 +706,7 @@ class GRUActorCritic(nn.Module):
                     memory_pose_buffer[has_memory],
                     memory_mask[has_memory],
                 )
+                mem_out = F.normalize(mem_out, p=2, dim=-1)
                 norms["memory"] = mem_out.norm(dim=-1).mean().item()
 
         return norms
