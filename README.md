@@ -94,12 +94,18 @@ Provides explicit spatial awareness of the agent's position relative to episode 
 
 ## Reward Function
 
+
+```
+  r_t = r_success + r_angle_success - Δd_tg - Δa_tg + r_slack
+```
+
 ```
   +--------------------------------------------------+
   |               Per-Step Reward                     |
   +--------------------------------------------------+
   |                                                  |
-  |  r_t = geodesic_scale * delta_geodesic           |
+  |  r_t = geodesic_scale * Δd_tg                    |
+  |       + angle_scale * Δa_tg  (only if < 1m)     |
   |       + slack_reward                             |
   |       + (collision_penalty if collided)           |
   |       + (rotation_penalty if rotated)             |
@@ -110,23 +116,29 @@ Provides explicit spatial awareness of the agent's position relative to episode 
   |             Terminal: Stop Action                  |
   +--------------------------------------------------+
   |                                                  |
-  |  if distance_to_goal < 1.0m:                     |
+  |  if dist < 1.0m:                                 |
   |      reward = +10.0  (success!)                  |
+  |      if heading_diff < 25°:                      |
+  |          reward += 5.0  (angle-success bonus)    |
   |  else:                                           |
-  |      reward = -2.0   (failed stop penalty)       |
+  |      reward = shaped_penalty(dist)               |
   |                                                  |
   +--------------------------------------------------+
 ```
+
+The angle-to-goal shaping (Δa_tg) is only active when the agent is within 1m of the goal position. This encourages the agent to first navigate to the goal, then orient to match the goal image viewpoint before calling Stop — matching the requirements for downstream ObjectNav transfer.
 
 ### Reward Parameters
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `geodesic_reward_scale` | 2.0 | Reward for reducing shortest-path distance to goal |
+| `angle_reward_scale` | 1.0 | Reward for reducing angle-to-goal heading (only within 1m) |
 | `slack_reward` | -0.01 | Per-step cost (encourages efficiency) |
 | `collision_penalty` | -0.01 | Discourages walking into walls |
 | `rotation_penalty` | -0.005 | Fixed cost per rotation (prevents spinning) |
 | `success_reward` | +10.0 | Large bonus for stopping within 1m of goal |
+| `angle_success_reward` | +5.0 | Bonus for stopping within 1m AND facing goal heading (±25°) |
 | `failed_stop_penalty` | -1.0 | Max penalty for stopping too far (shaped by distance) |
 | `min_steps_before_stop` | 20 | Stop action masked for first 20 steps |
 

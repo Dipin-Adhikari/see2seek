@@ -226,6 +226,12 @@ class PPOTrainer:
                 )
                 self.vec_env.set_max_steps(curr_max_steps)
 
+            # ---- Exploration bonus decay ----
+            if cfg.env.exploration_decay_steps > 0 and cfg.env.exploration_bonus > 0:
+                decay_progress = min(self._total_steps / cfg.env.exploration_decay_steps, 1.0)
+                curr_bonus = cfg.env.exploration_bonus * (1.0 - decay_progress)
+                self.vec_env.set_exploration_bonus(curr_bonus)
+
             # ---- Phase 1: Collect rollout ----
             self.policy.eval()    # eval for rollout (no dropout)
             collect_start = time.time()
@@ -369,7 +375,13 @@ class PPOTrainer:
                 )
 
                 if self._num_updates % cfg.ppo.log_interval == 0:
-                    self._log_branch_norms(patch_embed, cls_embed, goal_embed)
+                    self._log_branch_norms(
+                        patch_embed, cls_embed, goal_embed,
+                        pointgoal=pointgoal, poses=agent_poses,
+                        memory_buffer=memory_buffer,
+                        memory_pose_buffer=memory_pose_buffer,
+                        memory_mask=memory_mask,
+                    )
 
             self.buffer.compute_returns(
                 last_value  = last_value.squeeze(-1),
@@ -484,12 +496,22 @@ class PPOTrainer:
         patch_embed: torch.Tensor,
         cls_embed: torch.Tensor,
         goal_embed: torch.Tensor,
+        pointgoal=None,
+        poses=None,
+        memory_buffer=None,
+        memory_pose_buffer=None,
+        memory_mask=None,
     ) -> None:
-        """Log mean L2 norm of each fusion branch (spatial / cls / goal) as
-        they enter the concat, so scale parity between branches (e.g. after
-        adding LayerNorm to SpatialCompressionHead) can be verified directly
-        instead of inferred from downstream loss curves."""
-        norms = self.policy.branch_norms(patch_embed, cls_embed, goal_embed)
+        """Log mean L2 norm of each fusion branch (spatial / cls / goal /
+        pointgoal / egopose / memory) as they enter the concat, so scale
+        parity between branches can be verified directly."""
+        norms = self.policy.branch_norms(
+            patch_embed, cls_embed, goal_embed,
+            pointgoal=pointgoal, poses=poses,
+            memory_buffer=memory_buffer,
+            memory_pose_buffer=memory_pose_buffer,
+            memory_mask=memory_mask,
+        )
         parts = "  ".join(f"{name}={val:.3f}" for name, val in norms.items())
         logger.info(f"    branch_norms — {parts}")
 

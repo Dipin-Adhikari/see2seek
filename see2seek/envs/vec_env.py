@@ -73,6 +73,10 @@ def _worker(
                 env.set_max_steps(args[0])
                 conn.send("ok")
 
+            elif cmd == "set_exploration_bonus":
+                env.set_exploration_bonus(args[0])
+                conn.send("ok")
+
             elif cmd == "close":
                 env.close()
                 break
@@ -168,6 +172,12 @@ class VecEnv:
         """Update effective max_steps on all worker environments (curriculum)."""
         for conn in self._parent_conns:
             conn.send(("set_max_steps", max_steps))
+        self._recv_all()
+
+    def set_exploration_bonus(self, bonus: float) -> None:
+        """Update exploration bonus on all worker environments (decay)."""
+        for conn in self._parent_conns:
+            conn.send(("set_exploration_bonus", bonus))
         self._recv_all()
 
     def close(self) -> None:

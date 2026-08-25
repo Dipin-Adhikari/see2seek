@@ -167,8 +167,15 @@ class RoboTHOREnv:
         self._current_episode: Optional[Dict] = None
         self._cached_goal_embedding: Optional[torch.Tensor] = None
         self._prev_geodesic_dist: float = 0.0
+        self._prev_angle_to_goal: float = 0.0  # angle diff to goal heading (degrees)
+        self._goal_heading: float = 0.0         # optimal_goal_pose rotation
         self._num_steps: int = 0
         self._episode_collisions: int = 0
+
+        # Exploration tracking: visited grid cells this episode
+        self._visited_cells: set = set()
+        self._exploration_bonus: float = cfg.env.exploration_bonus
+        self._cell_size: float = cfg.env.exploration_cell_size
 
         # Curriculum: effective max_steps (updated by trainer)
         self._effective_max_steps: int = cfg.env.max_steps
@@ -407,6 +414,12 @@ class RoboTHOREnv:
             goal_pos = ep["shortest_path"][-1]
             self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
 
+            # 3a. Goal heading from optimal_goal_pose (for angle-to-goal reward)
+            optimal_pose = ep.get("optimal_goal_pose", {})
+            self._goal_heading = optimal_pose.get("rotation", 0.0)
+            agent_heading = event.metadata["agent"]["rotation"]["y"]
+            self._prev_angle_to_goal = self._angular_distance(agent_heading, self._goal_heading)
+
             # 3b. SPL bookkeeping: L = shortest-path length (sum of segment
             # lengths along the precomputed shortest_path waypoints), and
             # P = distance actually traveled this episode (accumulated in
@@ -414,6 +427,11 @@ class RoboTHOREnv:
             self._shortest_path_length = self._compute_path_length(ep["shortest_path"])
             self._path_length = 0.0
             self._last_agent_pos = dict(ep["initial_position"])
+
+            # 3c. Reset exploration tracking
+            self._visited_cells = set()
+            start_cell = self._pos_to_cell(ep["initial_position"])
+            self._visited_cells.add(start_cell)
 
             # 4. Fetch the environment state observations
             rgb = self._get_rgb_tensor(event.frame)
@@ -456,9 +474,12 @@ class RoboTHOREnv:
                 done, success, stop_dist = self._handle_stop()
                 if success:
                     reward = self.cfg.env.success_reward
+                    # Angle-success bonus: facing goal heading within threshold
+                    agent_heading = self._controller.last_event.metadata["agent"]["rotation"]["y"]
+                    angle_diff = self._angular_distance(agent_heading, self._goal_heading)
+                    if angle_diff <= self.cfg.env.angle_success_threshold:
+                        reward += self.cfg.env.angle_success_reward
                 elif self.cfg.env.shaped_stop:
-                    # Shaped penalty: closer stops are less punished.
-                    # At success_distance: 0 penalty. At 5m+: full penalty.
                     ratio = min((stop_dist - self.cfg.env.success_distance) / 4.0, 1.0)
                     reward = self.cfg.env.failed_stop_penalty * ratio
                 else:
@@ -504,12 +525,28 @@ class RoboTHOREnv:
         reward = raw_shaping
         reward += self.cfg.env.slack_reward
 
+        # Angle-to-goal shaping: only active within success_distance (1m)
+        # Encourages the agent to face the goal heading before calling Stop
+        if curr_dist <= self.cfg.env.success_distance:
+            agent_heading = event.metadata["agent"]["rotation"]["y"]
+            curr_angle = self._angular_distance(agent_heading, self._goal_heading)
+            angle_delta = (self._prev_angle_to_goal - curr_angle) / 180.0  # normalize to [-1, 1]
+            reward += angle_delta * self.cfg.env.angle_reward_scale
+            self._prev_angle_to_goal = curr_angle
+
         if action_name == "MoveAhead":
             if not event.metadata.get("lastActionSuccess", True):
                 reward += self.cfg.env.collision_penalty
                 self._episode_collisions += 1
         elif action_name in {"RotateLeft", "RotateRight"}:
             reward += self.cfg.env.rotation_penalty
+
+        # Intrinsic exploration bonus for visiting new grid cells
+        if self._exploration_bonus > 0:
+            cell = self._pos_to_cell(agent_pos)
+            if cell not in self._visited_cells:
+                self._visited_cells.add(cell)
+                reward += self._exploration_bonus
 
         self._prev_geodesic_dist = curr_dist
 
@@ -587,6 +624,12 @@ class RoboTHOREnv:
     # =======================================================================
     # Internal Pipeline Helper Functions
     # =======================================================================
+    @staticmethod
+    def _angular_distance(angle_a: float, angle_b: float) -> float:
+        """Minimum angular distance between two angles in degrees (0-180)."""
+        diff = abs((angle_a % 360) - (angle_b % 360))
+        return min(diff, 360 - diff)
+
     def _handle_stop(self) -> Tuple[bool, bool, float]:
         """Validates stopping threshold distance criteria against the final target path node."""
         goal_pos = self._current_episode["shortest_path"][-1]
@@ -747,6 +790,16 @@ class RoboTHOREnv:
     def set_max_steps(self, max_steps: int) -> None:
         """Update effective max_steps (called by trainer for curriculum scheduling)."""
         self._effective_max_steps = max_steps
+
+    def set_exploration_bonus(self, bonus: float) -> None:
+        """Update exploration bonus (called by trainer for decay scheduling)."""
+        self._exploration_bonus = bonus
+
+    def _pos_to_cell(self, pos: Dict) -> Tuple[int, int]:
+        """Discretize an (x, z) position into a grid cell."""
+        cx = int(pos["x"] / self._cell_size)
+        cz = int(pos["z"] / self._cell_size)
+        return (cx, cz)
 
     # =======================================================================
     # Environment Class Attribute Space Properties

@@ -666,6 +666,11 @@ class GRUActorCritic(nn.Module):
         patch_embeds: torch.Tensor,
         cls_embed: torch.Tensor,
         goal_embed: torch.Tensor,
+        pointgoal: Optional[torch.Tensor] = None,
+        poses: Optional[torch.Tensor] = None,
+        memory_buffer: Optional[torch.Tensor] = None,
+        memory_pose_buffer: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         """Diagnostic: mean per-sample L2 norm of each fusion branch."""
         norms = {}
@@ -682,6 +687,26 @@ class GRUActorCritic(nn.Module):
         else:
             obs_feat = F.normalize(self.obs_proj(cls_embed), p=2, dim=-1)
             norms["obs"] = obs_feat.norm(dim=-1).mean().item()
+
+        if pointgoal is not None:
+            pg_feat = self.pointgoal_proj(pointgoal)
+            norms["pointgoal"] = pg_feat.norm(dim=-1).mean().item()
+
+        if self.use_egopose and poses is not None:
+            ego_feat = self.egopose_proj(poses)
+            norms["egopose"] = ego_feat.norm(dim=-1).mean().item()
+
+        if memory_buffer is not None and memory_mask is not None:
+            has_memory = memory_mask.any(dim=1)
+            if has_memory.any() and poses is not None:
+                mem_out = self.episodic_memory(
+                    cls_embed[has_memory],
+                    poses[has_memory],
+                    memory_buffer[has_memory],
+                    memory_pose_buffer[has_memory],
+                    memory_mask[has_memory],
+                )
+                norms["memory"] = mem_out.norm(dim=-1).mean().item()
 
         return norms
 
