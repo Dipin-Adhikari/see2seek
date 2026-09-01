@@ -96,6 +96,10 @@ class PPOTrainer:
             lr=cfg.ppo.lr,
             eps=cfg.ppo.eps,
         )
+        total_updates = cfg.ppo.total_num_steps // (cfg.ppo.num_steps * cfg.env.num_envs)
+        self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimiser, start_factor=1.0, end_factor=0.1, total_iters=total_updates
+        )
 
         # ---- Environments ----
         logger.info(f"Launching {cfg.env.num_envs} parallel environments ...")
@@ -215,6 +219,10 @@ class PPOTrainer:
         agent_poses[:, 2] = 1.0  # cos(0) = 1
         # agent_poses[:, 3] = 0.0  # sin(0) = 0 (already zero)
 
+        # Per-episode pointgoal dropout: decide once per episode whether GPS is available
+        pg_episode_mask = (torch.rand(cfg.env.num_envs, 1, device=self.device)
+                           > cfg.encoder.pointgoal_dropout).float()
+
         steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)
         while self._total_steps < cfg.ppo.total_num_steps:
             # ---- Curriculum: update effective max_steps ----
@@ -252,14 +260,10 @@ class PPOTrainer:
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
 
-                    # 1c. PointGoal sensor (with dropout for zero-shot transfer)
+                    # 1c. PointGoal sensor (per-episode dropout for zero-shot transfer)
                     pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
-                    pg_dropped = torch.zeros(pointgoal.shape[0], device=self.device, dtype=torch.bool)
-                    if cfg.encoder.pointgoal_dropout > 0.0:
-                        drop_mask = (torch.rand(pointgoal.shape[0], 1, device=self.device)
-                                     > cfg.encoder.pointgoal_dropout).float()
-                        pointgoal = pointgoal * drop_mask
-                        pg_dropped = (drop_mask.squeeze(1) == 0)
+                    pointgoal = pointgoal * pg_episode_mask
+                    pg_dropped = (pg_episode_mask.squeeze(1) == 0)
 
                     # 1d. Policy forward (with position-augmented episodic memory)
                     dist, value, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
@@ -325,6 +329,12 @@ class PPOTrainer:
                         if "spl" in info:
                             self._recent_spls.append(info["spl"])
                         self._running_reward[env_idx] = 0.0
+
+                # Re-roll per-episode pointgoal dropout for newly started episodes
+                if dones_dev.any():
+                    new_rolls = (torch.rand(dones_dev.sum().item(), 1, device=self.device)
+                                 > cfg.encoder.pointgoal_dropout).float()
+                    pg_episode_mask[dones_dev] = new_rolls
 
                 # 1e. Build masks for NEXT step (0 if this step was terminal)
                 new_masks = (~dones).float().unsqueeze(1).to(self.device)  # (N, 1)
@@ -392,6 +402,7 @@ class PPOTrainer:
             # ---- Phase 3: PPO update ----
             self.policy.train()
             update_metrics = self._ppo_update()
+            self.lr_scheduler.step()
             self._num_updates += 1
 
             # ---- Phase 4: Carry state forward ----
@@ -556,6 +567,7 @@ class PPOTrainer:
         torch.save({
             "policy_state_dict":    self.policy.state_dict(),
             "optimiser_state_dict": self.optimiser.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
             "total_steps":          self._total_steps,
             "num_updates":          self._num_updates,
             "cfg":                  self.cfg,
@@ -568,6 +580,8 @@ class PPOTrainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.optimiser.load_state_dict(ckpt["optimiser_state_dict"])
+        if "lr_scheduler_state_dict" in ckpt:
+            self.lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
         self._total_steps = ckpt.get("total_steps", 0)
         self._num_updates = ckpt.get("num_updates", 0)
         logger.info(f"Resumed at step {self._total_steps:,}")

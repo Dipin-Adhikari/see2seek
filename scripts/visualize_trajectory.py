@@ -67,7 +67,7 @@ def parse_args():
     p.add_argument("--config", default=None, help="Path to YAML config override")
     p.add_argument("--episodes", nargs="+", default=None, help="Episode IDs to visualize")
     p.add_argument("--use_list", action="store_true", help="Use hardcoded EPISODE_LIST")
-    p.add_argument("--output_dir", default="data_dino_v4/visualizations", help="Output directory for plots")
+    p.add_argument("--output_dir", default="data_dino_v5/visualizations", help="Output directory for plots")
     p.add_argument("--max_steps", type=int, default=500, help="Max steps per episode")
     p.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
     p.add_argument("--dpi", type=int, default=150, help="Output image DPI")

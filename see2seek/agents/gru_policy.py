@@ -416,6 +416,7 @@ class GRUActorCritic(nn.Module):
         """
         prev_act_embed = self.prev_action_embed(prev_actions)
         pointgoal_feat = self.pointgoal_proj(pointgoal)
+        pointgoal_feat = F.normalize(pointgoal_feat, p=2, dim=-1)
         goal_feat = self.goal_proj(goal_embed)
         goal_feat = F.normalize(goal_feat, p=2, dim=-1)
 
@@ -438,6 +439,7 @@ class GRUActorCritic(nn.Module):
         # Add ego-pose as direct input (dead-reckoned position relative to start)
         if self.use_egopose and poses is not None:
             egopose_feat = self.egopose_proj(poses)
+            egopose_feat = F.normalize(egopose_feat, p=2, dim=-1)
             parts.append(egopose_feat)
 
         return torch.cat(parts, dim=-1)
