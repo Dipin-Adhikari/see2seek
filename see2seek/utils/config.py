@@ -107,7 +107,7 @@ class EnvConfig:
     curriculum_ramp_steps: int = 2_000_000          # env steps over which to ramp
 
     # --- Parallelism ---
-    num_envs: int = 1                    # number of parallel rollout workers
+    num_envs: int = 16                    # number of parallel rollout workers
 
 
 # ---------------------------------------------------------------------------

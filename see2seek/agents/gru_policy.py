@@ -691,11 +691,11 @@ class GRUActorCritic(nn.Module):
             norms["obs"] = obs_feat.norm(dim=-1).mean().item()
 
         if pointgoal is not None:
-            pg_feat = self.pointgoal_proj(pointgoal)
+            pg_feat = F.normalize(self.pointgoal_proj(pointgoal), p=2, dim=-1)
             norms["pointgoal"] = pg_feat.norm(dim=-1).mean().item()
 
         if self.use_egopose and poses is not None:
-            ego_feat = self.egopose_proj(poses)
+            ego_feat = F.normalize(self.egopose_proj(poses), p=2, dim=-1)
             norms["egopose"] = ego_feat.norm(dim=-1).mean().item()
 
         if memory_buffer is not None and memory_mask is not None:
