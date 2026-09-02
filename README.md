@@ -15,7 +15,7 @@ We compare DINOv2's spatial patch features against CLIP's contrastive features a
 | Spatial | DINOv2 patches (256x768) -> 2-layer CNN | Yes | 1568 |
 | CLS | DINOv2 CLS token (768) -> Linear/LN/ELU | Yes | 64 |
 | Goal | CLIP ViT-B/32 embedding (512) -> Linear/LN/ELU | Yes | 512 |
-| Episodic Memory | Cross-attention over last 64 CLS tokens + poses | Yes | 128 |
+| Episodic Memory | Cross-attention over last 128 CLS tokens + poses | Yes | 128 |
 | Prev Action | Learned embedding of last action | Yes | 32 |
 | PointGoal | [geodesic_dist, cos, sin] -> Linear+ReLU | Yes | 32 |
 | Ego-Pose | [x, y, cos_theta, sin_theta] -> Linear+ReLU | Yes | 32 |
@@ -33,16 +33,16 @@ We compare DINOv2's spatial patch features against CLIP's contrastive features a
          v
   +--------------------------------+
   | Cross-Attention                |
-  |   Query: current CLS          |
-  |   Keys/Values: last 64 CLS    |
-  |   (circular buffer, detached) |
+  |   Query: current CLS + pose    |
+  |   Keys/Values: last 128 CLS    |
+  |   + pose history (detached)    |
   +--------------------------------+
          |
          v
   Output projection -> (128-d) "have I been here before?" signal
 ```
 
-The memory buffer resets at episode boundaries. Stored tokens are detached (no BPTT through time) — only the Q/K/V projections and output projection are trainable. This gives the agent a loop-detection signal without explicit map construction.
+The memory buffer resets at episode boundaries. Stored tokens are detached (no BPTT through time) — only the Q/K/V projections, pose embedding, and output projection are trainable. This gives the agent a loop-detection signal without explicit map construction.
 
 ### CLIP Baseline
 
@@ -71,7 +71,7 @@ The memory buffer resets at episode boundaries. Stored tokens are detached (no B
   [ geodesic_dist, cos(angle), sin(angle) ]   -->  Linear(3, 32) + ReLU  -->  (32-d)
 ```
 
-Used during **ImageNav training/eval** (goal location known). Dropped 50% of training time for zero-shot transfer. For **ObjectNav** testing, zeroed out entirely — the GRU retains learned navigation behaviors from training.
+Used during **ImageNav training/eval** (goal location known). Dropped 50% of training time via **per-episode dropout** — each episode either has full GPS or none, decided at episode start. This prevents the GRU's recurrent state from leaking GPS information across steps (a per-step dropout would allow the hidden state to cache GPS from ON-steps and replay it during OFF-steps, inflating training SR without actually learning visual navigation). For **ObjectNav** testing, zeroed out entirely — the GRU retains learned navigation behaviors from training.
 
 ### Ego-Pose Sensor (Dead-Reckoned Position)
 
@@ -90,43 +90,43 @@ Used during **ImageNav training/eval** (goal location known). Dropped 50% of tra
   [ x, y, cos(theta), sin(theta) ]   -->  Linear(4, 32) + ReLU  -->  (32-d)
 ```
 
-Provides explicit spatial awareness of the agent's position relative to episode start. Combined with episodic memory, enables loop detection and room escape behavior without depth sensors or explicit mapping. The pose is accumulated from discrete actions (MoveAhead: x += 0.25*sin(θ), y += 0.25*cos(θ); Rotate: update θ by ±30°).
+Provides explicit spatial awareness of the agent's position relative to episode start. Combined with episodic memory, enables loop detection and room escape behavior without depth sensors or explicit mapping. The pose is accumulated from discrete actions (MoveAhead: x += 0.25*sin(θ), y += 0.25*cos(θ); Rotate: update θ by ±30°), but **only when the action actually succeeds** — failed MoveAhead actions (wall collisions) do not update the pose, keeping dead-reckoned position aligned with the agent's true location.
 
 ## Reward Function
 
-
 ```
-  r_t = r_success + r_angle_success - Δd_tg - Δa_tg + r_slack
-```
-
-```
-  +--------------------------------------------------+
-  |               Per-Step Reward                     |
-  +--------------------------------------------------+
-  |                                                  |
-  |  r_t = geodesic_scale * Δd_tg                    |
-  |       + angle_scale * Δa_tg  (only if < 1m)     |
-  |       + slack_reward                             |
-  |       + (collision_penalty if collided)           |
-  |       + (rotation_penalty if rotated)             |
-  |                                                  |
-  +--------------------------------------------------+
-
-  +--------------------------------------------------+
-  |             Terminal: Stop Action                  |
-  +--------------------------------------------------+
-  |                                                  |
-  |  if dist < 1.0m:                                 |
-  |      reward = +10.0  (success!)                  |
-  |      if heading_diff < 25°:                      |
-  |          reward += 5.0  (angle-success bonus)    |
-  |  else:                                           |
-  |      reward = shaped_penalty(dist)               |
-  |                                                  |
-  +--------------------------------------------------+
+  r_t = geodesic_scale * Δd_tg + angle_scale * Δa_tg + r_slack + r_explore + r_collision + r_rotation
 ```
 
-The angle-to-goal shaping (Δa_tg) is only active when the agent is within 1m of the goal position. This encourages the agent to first navigate to the goal, then orient to match the goal image viewpoint before calling Stop — matching the requirements for downstream ObjectNav transfer.
+```
+  +-----------------------------------------------------------+
+  |                    Per-Step Reward                         |
+  +-----------------------------------------------------------+
+  |                                                           |
+  |  r_t = geodesic_reward_scale * Δd_tg                     |
+  |       + angle_reward_scale * Δa_tg  (only if < 1m)       |
+  |       + slack_reward                                      |
+  |       + exploration_bonus if visiting a new cell         |
+  |       + collision_penalty if collided                    |
+  |       + rotation_penalty if rotated                      |
+  |                                                           |
+  +-----------------------------------------------------------+
+
+  +-----------------------------------------------------------+
+  |                  Terminal: Stop Action                     |
+  +-----------------------------------------------------------+
+  |                                                           |
+  |  if dist < success_distance:                              |
+  |      reward = success_reward                              |
+  |      if heading_diff < angle_success_threshold:           |
+  |          reward += angle_success_reward                   |
+  |  else:                                                    |
+  |      reward = failed_stop_penalty * shaped_distance_term |
+  |                                                           |
+  +-----------------------------------------------------------+
+```
+
+The angle-to-goal shaping (Δa_tg) is only active when the agent is within 1m of the goal position. This encourages the agent to first navigate to the goal, then orient to match the goal image viewpoint before calling Stop — matching the requirements for downstream ObjectNav transfer. The exploration bonus is also included as an intrinsic reward for new grid-cell visits and decays over time via the curriculum/exploration schedule.
 
 ### Reward Parameters
 
@@ -137,6 +137,8 @@ The angle-to-goal shaping (Δa_tg) is only active when the agent is within 1m of
 | `slack_reward` | -0.01 | Per-step cost (encourages efficiency) |
 | `collision_penalty` | -0.01 | Discourages walking into walls |
 | `rotation_penalty` | -0.005 | Fixed cost per rotation (prevents spinning) |
+| `exploration_bonus` | 0.05 | Intrinsic reward for visiting a new grid cell |
+| `exploration_decay_steps` | 3_000_000 | Linearly decays exploration bonus to 0 |
 | `success_reward` | +10.0 | Large bonus for stopping within 1m of goal |
 | `angle_success_reward` | +5.0 | Bonus for stopping within 1m AND facing goal heading (±25°) |
 | `failed_stop_penalty` | -1.0 | Max penalty for stopping too far (shaped by distance) |
@@ -165,11 +167,13 @@ python scripts/train.py --debug
 - **Environments:** 16 parallel RoboTHOR workers (shared-memory VecEnv)
 - **Rollout:** 128 steps/env = 2048 steps per PPO update
 - **PPO:** 4 epochs, 2 mini-batches, clip=0.2, entropy_coef=0.03
-- **Optimizer:** Adam, lr=2.5e-4
+- **Optimizer:** Adam, lr=2.5e-4 with linear decay to 0.1x over training
 - **Total steps:** 10M
 - **GRU:** 2-layer, 512 hidden units
-- **Episodic memory:** 64-slot circular buffer, single-head cross-attention
-- **PointGoal dropout:** 50% (for zero-shot ObjectNav transfer)
+- **Episodic memory:** 128-slot circular buffer, single-head cross-attention with pose conditioning
+- **PointGoal dropout:** 50% per-episode (for zero-shot ObjectNav transfer)
+- **Exploration bonus:** +0.05 per new cell, decays over 3,000,000 env steps
+- **Curriculum:** max_steps ramps from 150 to 500 over 2,000,000 env steps
 
 ## Evaluation
 
@@ -192,8 +196,6 @@ python scripts/eval.py --checkpoint data_dino_v3/checkpoints/clip_checkpoint.pth
 - **SR (Success Rate):** Fraction of episodes where agent stops within 1m of goal
 - **SPL (Success weighted by Path Length):** SR penalized by path inefficiency
 
-
-
 ## Project Structure
 
 ```
@@ -201,7 +203,9 @@ See2Seek/
 ├── scripts/
 │   ├── train.py              # Training entry point
 │   ├── eval.py               # Evaluation entry point
-│   └── plot_training.py      # Training curve visualization
+│   ├── plot_evaluation.py    # Evaluation plot generation
+│   ├── plot_training.py      # Training curve visualization
+│   └── visualize_trajectory.py # Trajectory visualization
 ├── see2seek/
 │   ├── agents/
 │   │   └── gru_policy.py     # 2-layer GRU Actor-Critic + Episodic Memory + SpatialCompressionHead
@@ -218,40 +222,43 @@ See2Seek/
 │   ├── evaluation/
 │   │   └── evaluator.py      # Parallel evaluation loop
 │   └── utils/
-│       ├── config.py         # Central configuration
-│       └── augment_goal_angles.py  # Multi-angle goal augmentation (optional preprocessing)
+│       └── config.py         # Central configuration
 ├── configs/
+│   ├── eval.yaml             # evaluation config
 │   └── train_robothor.yaml   # YAML config overrides
-├── dataset/                  # Primary dataset (train/val/debug splits)
-│   ├── train/
-│   │   ├── episodes/         # 120 episode JSON files
-│   │   └── embeddings.pt     # Pre-cached CLIP goal embeddings
-│   └── val/
-│       ├── episodes/         # 15 episode JSON files
-│       └── embeddings.pt
-└── data_dino_v3/             # Training outputs (checkpoints, logs)
-    ├── checkpoints/
-    ├── logs/
-    └── goal_datasets/
+├── data_dino_v5/             # checkpoints, logs, goal caches (current)
+├── dataset/                  # RoboTHOR episode data
+├── docs/                     # architecture diagrams
+├── tests/
+├── requirements.txt
+├── setup.py
+├── README.md
+└── .gitignore
 ```
 
 ## Key Design Decisions
 
 1. **Frozen encoders, trainable fusion:** DINOv2 and CLIP never update — only the spatial CNN, CLS projection, goal projection, episodic memory, and GRU train. This keeps compute low and leverages pretrained representations.
 
-2. **Episodic memory for loop detection:** Instead of explicit mapping, the agent uses attention over past CLS tokens to detect revisited locations. This lightweight mechanism enables multi-room navigation without constructing a spatial map.
+2. **Episodic memory for loop detection:** Instead of explicit mapping, the agent uses attention over past CLS tokens plus pose information to detect revisited locations. This lightweight mechanism enables multi-room navigation without constructing a spatial map.
 
 3. **Trainable goal projection:** The CLIP goal embedding passes through a learned Linear/LN/ELU layer (512->512) so the model can shape goal representations for navigation rather than relying on the GRU to implicitly project.
 
 4. **2-layer GRU:** Hierarchical temporal processing — layer 1 fuses multimodal perception, layer 2 handles planning and temporal reasoning over longer horizons.
 
-5. **Asymmetric terminal rewards:** Success (+10.0) vs failed stop (-2.0) ensures the expected value of exploration dominates premature stopping, even at low success rates. Prevents degenerate "wait-then-stop" policies.
+5. **Asymmetric terminal rewards:** Success (+10.0) vs failed stop (-1.0 shaped) ensures the expected value of exploration dominates premature stopping, even at low success rates. Prevents degenerate "wait-then-stop" policies.
 
 6. **Raw token storage in buffer:** The rollout buffer stores raw DINOv2 outputs (not compressed features) so gradients flow through trainable heads during PPO updates.
 
-7. **L2-normalized branches:** Spatial, CLS, and Goal branches are all L2-normalized to unit norm before concatenation, ensuring no branch dominates by magnitude alone.
+7. **L2-normalized branches:** Spatial, CLS, Goal, PointGoal, and Ego-Pose branches are all L2-normalized to unit norm before concatenation, ensuring no branch dominates by magnitude alone.
 
-8. **PointGoal as training signal with 50% dropout:** GPS+Compass sensor teaches the GRU *how to navigate* during ImageNav; learned behaviors transfer to ObjectNav at test time where PointGoal is unavailable.
+8. **Per-episode PointGoal dropout (50%):** GPS+Compass sensor teaches the GRU *how to navigate* during ImageNav; learned behaviors transfer to ObjectNav at test time where PointGoal is unavailable. Dropout is per-episode (not per-step) to prevent the GRU hidden state from leaking GPS across steps.
+
+9. **Collision-aware dead reckoning:** Ego-pose accumulator only updates on successful MoveAhead actions. Failed moves (wall collisions) leave the pose unchanged, keeping dead-reckoned position consistent with reward signals and preventing corrupted poses from propagating into episodic memory's position-aware attention.
+
+10. **Cached geodesic distance:** The Unity RPC for shortest-path distance is only called when the agent's position actually changes (successful MoveAhead). Rotations and failed moves reuse the cached value, eliminating ~60-70% of per-step RPCs.
+
+11. **Linear LR decay:** Learning rate decays linearly to 10% of initial value over training, preventing late-stage policy oscillation and entropy collapse after convergence.
 
 ## References
 

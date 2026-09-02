@@ -275,6 +275,9 @@ class PPOTrainer:
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
 
+                # Bug 2 fix: snapshot pre-step pose (what the policy actually saw)
+                pose_for_buffer = agent_poses.clone()
+
                 # 1d. Step environments
                 obs_dict, rewards, dones, infos = self.vec_env.step(actions)
                 rewards = rewards.to(self.device)
@@ -289,8 +292,12 @@ class PPOTrainer:
                 agent_poses[dones_dev] = 0.0
                 agent_poses[dones_dev, 2] = 1.0
 
-                # MoveAhead: x += step*sin_theta, y += step*cos_theta
-                is_move = (acts_dev == 0) & ~dones_dev
+                # Bug 0 fix: only update pose when MoveAhead actually succeeded
+                move_success = torch.tensor(
+                    [infos[i].get("move_success", True) for i in range(cfg.env.num_envs)],
+                    dtype=torch.bool, device=self.device,
+                )
+                is_move = (acts_dev == 0) & ~dones_dev & move_success
                 if is_move.any():
                     agent_poses[is_move, 0] += cfg.env.move_magnitude * agent_poses[is_move, 3]
                     agent_poses[is_move, 1] += cfg.env.move_magnitude * agent_poses[is_move, 2]
@@ -354,7 +361,7 @@ class PPOTrainer:
                     can_stop    = can_stop,
                     pointgoal   = pointgoal,
                     pointgoal_dropped = pg_dropped,
-                    pose        = agent_poses,
+                    pose        = pose_for_buffer,
                 )
 
                 # 1g. Update recurrent state

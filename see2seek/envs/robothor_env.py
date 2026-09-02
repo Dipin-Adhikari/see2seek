@@ -513,7 +513,14 @@ class RoboTHOREnv:
             )
 
         goal_pos = self._current_episode["shortest_path"][-1]
-        curr_dist = self._get_geodesic_distance(goal_pos)
+        # Bug 5 fix: only recompute geodesic distance when position actually
+        # changed (successful MoveAhead). Rotations and failed moves don't
+        # change position, so the cached value is exact — saves one Unity RPC
+        # per step on ~60-70% of actions.
+        if action_name == "MoveAhead" and event.metadata.get("lastActionSuccess", True):
+            curr_dist = self._get_geodesic_distance(goal_pos)
+        else:
+            curr_dist = self._prev_geodesic_dist
 
         raw_shaping = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
         # Clip to a sane per-step range — one MoveAhead step is ~0.25m, so a
@@ -555,6 +562,10 @@ class RoboTHOREnv:
             reward += self.cfg.env.failed_stop_penalty
 
         info = self._build_info(success=False, done=done)
+        info["move_success"] = (
+            event.metadata.get("lastActionSuccess", True)
+            if action_name == "MoveAhead" else True
+        )
 
         obs = {
             "rgb": self._get_rgb_tensor(event.frame),
