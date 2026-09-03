@@ -132,6 +132,7 @@ class PPOTrainer:
         self._recent_rewards   = deque(maxlen=100)
         self._recent_successes = deque(maxlen=100)
         self._recent_spls      = deque(maxlen=100)
+        self._recent_ep_lengths = deque(maxlen=100)
         self._running_reward   = torch.zeros(cfg.env.num_envs, device=self.device)
 
         # ---- Per-GPS-condition metrics (split by pointgoal on/off) ----
@@ -354,6 +355,8 @@ class PPOTrainer:
                             self._recent_successes.append(ep_success)
                         if ep_spl is not None:
                             self._recent_spls.append(ep_spl)
+                        ep_len = info.get("num_steps", 0)
+                        self._recent_ep_lengths.append(ep_len)
 
                         # Split metrics by GPS condition (only when GPS is used)
                         if self._with_pointgoal:
@@ -645,6 +648,7 @@ class PPOTrainer:
         mean_reward  = sum(self._recent_rewards)   / len(self._recent_rewards)   if self._recent_rewards   else 0.0
         success_rate = sum(self._recent_successes) / len(self._recent_successes) if self._recent_successes else 0.0
         mean_spl     = sum(self._recent_spls)      / len(self._recent_spls)      if self._recent_spls      else 0.0
+        mean_ep_len  = sum(self._recent_ep_lengths) / len(self._recent_ep_lengths) if self._recent_ep_lengths else 0.0
 
         # GPS-split metrics (only when pointgoal is used)
         if self._with_pointgoal:
@@ -675,6 +679,7 @@ class PPOTrainer:
             f"reward={mean_reward:.3f}  "
             f"SR={success_rate:.3f}  "
             f"SPL={mean_spl:.3f}  "
+            f"avg_steps={mean_ep_len:.0f}  "
             f"fps={fps:.0f}  "
             f"max_steps={curr_max_steps}"
         )
@@ -695,6 +700,7 @@ class PPOTrainer:
                 "train/mean_episode_reward": mean_reward,
                 "train/success_rate": success_rate,
                 "train/spl": mean_spl,
+                "train/avg_ep_length": mean_ep_len,
             })
             if self._with_pointgoal:
                 self._wandb.log({
