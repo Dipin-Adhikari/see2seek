@@ -126,6 +126,7 @@ class PPOTrainer:
         self._total_steps = 0
         self._num_updates = 0
         self._start_time  = time.time()
+        self._with_pointgoal = getattr(cfg.encoder, "with_pointgoal", False)
 
         # ---- Episode-level metric tracking (rolling window over last 100 episodes) ----
         self._recent_rewards   = deque(maxlen=100)
@@ -227,9 +228,12 @@ class PPOTrainer:
         agent_poses[:, 2] = 1.0  # cos(0) = 1
         # agent_poses[:, 3] = 0.0  # sin(0) = 0 (already zero)
 
-        # Per-episode pointgoal dropout: decide once per episode whether GPS is available
-        pg_episode_mask = (torch.rand(cfg.env.num_envs, 1, device=self.device)
-                           > cfg.encoder.pointgoal_dropout).float()
+        # Per-episode pointgoal dropout (only when GPS is used)
+        if self._with_pointgoal:
+            pg_episode_mask = (torch.rand(cfg.env.num_envs, 1, device=self.device)
+                               > cfg.encoder.pointgoal_dropout).float()
+        else:
+            pg_episode_mask = None
 
         steps_since_reset = torch.zeros(cfg.env.num_envs, device=self.device)
         while self._total_steps < cfg.ppo.total_num_steps:
@@ -268,10 +272,14 @@ class PPOTrainer:
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
 
-                    # 1c. PointGoal sensor (per-episode dropout for zero-shot transfer)
-                    pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
-                    pointgoal = pointgoal * pg_episode_mask
-                    pg_dropped = (pg_episode_mask.squeeze(1) == 0)
+                    # 1c. PointGoal sensor
+                    if self._with_pointgoal:
+                        pointgoal = obs_dict["pointgoal"].to(self.device)  # (N, 3)
+                        pointgoal = pointgoal * pg_episode_mask
+                        pg_dropped = (pg_episode_mask.squeeze(1) == 0)
+                    else:
+                        pointgoal = None
+                        pg_dropped = None
 
                     # 1d. Policy forward (with position-augmented episodic memory)
                     dist, value, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
@@ -347,25 +355,26 @@ class PPOTrainer:
                         if ep_spl is not None:
                             self._recent_spls.append(ep_spl)
 
-                        # Split metrics by GPS condition (mask was set at episode start)
-                        gps_on = pg_episode_mask[env_idx].item() > 0.5
-                        if gps_on:
-                            self._recent_rewards_gps_on.append(ep_reward)
-                            if ep_success is not None:
-                                self._recent_successes_gps_on.append(ep_success)
-                            if ep_spl is not None:
-                                self._recent_spls_gps_on.append(ep_spl)
-                        else:
-                            self._recent_rewards_gps_off.append(ep_reward)
-                            if ep_success is not None:
-                                self._recent_successes_gps_off.append(ep_success)
-                            if ep_spl is not None:
-                                self._recent_spls_gps_off.append(ep_spl)
+                        # Split metrics by GPS condition (only when GPS is used)
+                        if self._with_pointgoal:
+                            gps_on = pg_episode_mask[env_idx].item() > 0.5
+                            if gps_on:
+                                self._recent_rewards_gps_on.append(ep_reward)
+                                if ep_success is not None:
+                                    self._recent_successes_gps_on.append(ep_success)
+                                if ep_spl is not None:
+                                    self._recent_spls_gps_on.append(ep_spl)
+                            else:
+                                self._recent_rewards_gps_off.append(ep_reward)
+                                if ep_success is not None:
+                                    self._recent_successes_gps_off.append(ep_success)
+                                if ep_spl is not None:
+                                    self._recent_spls_gps_off.append(ep_spl)
 
                         self._running_reward[env_idx] = 0.0
 
                 # Re-roll per-episode pointgoal dropout for newly started episodes
-                if dones_dev.any():
+                if self._with_pointgoal and dones_dev.any():
                     new_rolls = (torch.rand(dones_dev.sum().item(), 1, device=self.device)
                                  > cfg.encoder.pointgoal_dropout).float()
                     pg_episode_mask[dones_dev] = new_rolls
@@ -410,7 +419,7 @@ class PPOTrainer:
                     cls_embed = self.goal_encoder.get_obs_embedding(rgb)
                     patch_embed = None
                 goal_embed = self._get_goal_embeddings(obs_dict)
-                pointgoal = obs_dict["pointgoal"].to(self.device)
+                pointgoal = obs_dict["pointgoal"].to(self.device) if self._with_pointgoal else None
                 _, last_value, _, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks,
                     pointgoal=pointgoal,
@@ -502,13 +511,16 @@ class PPOTrainer:
                 # Value loss (MSE)
                 value_loss = F.mse_loss(values.squeeze(-1), batch.returns)
 
-                # Per-sample entropy weighting: higher entropy bonus for GPS-off steps
-                entropy_coefs = torch.where(
-                    batch.pointgoal_dropped,
-                    cfg.ppo.entropy_coef_gps_off,
-                    cfg.ppo.entropy_coef_gps_on,
-                )
-                weighted_entropy = (entropy_coefs * entropy_per_sample).mean()
+                # Entropy bonus: per-sample weighting when GPS is used, single coef otherwise
+                if self._with_pointgoal:
+                    entropy_coefs = torch.where(
+                        batch.pointgoal_dropped,
+                        cfg.ppo.entropy_coef_gps_off,
+                        cfg.ppo.entropy_coef_gps_on,
+                    )
+                    weighted_entropy = (entropy_coefs * entropy_per_sample).mean()
+                else:
+                    weighted_entropy = cfg.ppo.entropy_coef * entropy_per_sample.mean()
                 entropy = entropy_per_sample.mean()
 
                 # Total loss
@@ -634,17 +646,16 @@ class PPOTrainer:
         success_rate = sum(self._recent_successes) / len(self._recent_successes) if self._recent_successes else 0.0
         mean_spl     = sum(self._recent_spls)      / len(self._recent_spls)      if self._recent_spls      else 0.0
 
-        # GPS-ON metrics
-        sr_gps_on  = sum(self._recent_successes_gps_on)  / len(self._recent_successes_gps_on)  if self._recent_successes_gps_on  else 0.0
-        spl_gps_on = sum(self._recent_spls_gps_on)       / len(self._recent_spls_gps_on)       if self._recent_spls_gps_on       else 0.0
-        rw_gps_on  = sum(self._recent_rewards_gps_on)    / len(self._recent_rewards_gps_on)    if self._recent_rewards_gps_on    else 0.0
-        n_gps_on   = len(self._recent_successes_gps_on)
-
-        # GPS-OFF metrics
-        sr_gps_off  = sum(self._recent_successes_gps_off) / len(self._recent_successes_gps_off) if self._recent_successes_gps_off else 0.0
-        spl_gps_off = sum(self._recent_spls_gps_off)      / len(self._recent_spls_gps_off)      if self._recent_spls_gps_off      else 0.0
-        rw_gps_off  = sum(self._recent_rewards_gps_off)   / len(self._recent_rewards_gps_off)   if self._recent_rewards_gps_off   else 0.0
-        n_gps_off   = len(self._recent_successes_gps_off)
+        # GPS-split metrics (only when pointgoal is used)
+        if self._with_pointgoal:
+            sr_gps_on  = sum(self._recent_successes_gps_on)  / len(self._recent_successes_gps_on)  if self._recent_successes_gps_on  else 0.0
+            spl_gps_on = sum(self._recent_spls_gps_on)       / len(self._recent_spls_gps_on)       if self._recent_spls_gps_on       else 0.0
+            rw_gps_on  = sum(self._recent_rewards_gps_on)    / len(self._recent_rewards_gps_on)    if self._recent_rewards_gps_on    else 0.0
+            n_gps_on   = len(self._recent_successes_gps_on)
+            sr_gps_off  = sum(self._recent_successes_gps_off) / len(self._recent_successes_gps_off) if self._recent_successes_gps_off else 0.0
+            spl_gps_off = sum(self._recent_spls_gps_off)      / len(self._recent_spls_gps_off)      if self._recent_spls_gps_off      else 0.0
+            rw_gps_off  = sum(self._recent_rewards_gps_off)   / len(self._recent_rewards_gps_off)   if self._recent_rewards_gps_off   else 0.0
+            n_gps_off   = len(self._recent_successes_gps_off)
 
         # Curriculum max_steps (if enabled)
         if self.cfg.env.curriculum_enabled:
@@ -667,10 +678,11 @@ class PPOTrainer:
             f"fps={fps:.0f}  "
             f"max_steps={curr_max_steps}"
         )
-        logger.info(
-            f"    GPS-ON  (n={n_gps_on:>3}): SR={sr_gps_on:.3f}  SPL={spl_gps_on:.3f}  reward={rw_gps_on:.3f}  |  "
-            f"GPS-OFF (n={n_gps_off:>3}): SR={sr_gps_off:.3f}  SPL={spl_gps_off:.3f}  reward={rw_gps_off:.3f}"
-        )
+        if self._with_pointgoal:
+            logger.info(
+                f"    GPS-ON  (n={n_gps_on:>3}): SR={sr_gps_on:.3f}  SPL={spl_gps_on:.3f}  reward={rw_gps_on:.3f}  |  "
+                f"GPS-OFF (n={n_gps_off:>3}): SR={sr_gps_off:.3f}  SPL={spl_gps_off:.3f}  reward={rw_gps_off:.3f}"
+            )
 
         if self._wandb is not None:
             self._wandb.log({
@@ -683,10 +695,13 @@ class PPOTrainer:
                 "train/mean_episode_reward": mean_reward,
                 "train/success_rate": success_rate,
                 "train/spl": mean_spl,
-                "train/sr_gps_on":      sr_gps_on,
-                "train/spl_gps_on":     spl_gps_on,
-                "train/reward_gps_on":  rw_gps_on,
-                "train/sr_gps_off":     sr_gps_off,
-                "train/spl_gps_off":    spl_gps_off,
-                "train/reward_gps_off": rw_gps_off,
             })
+            if self._with_pointgoal:
+                self._wandb.log({
+                    "train/sr_gps_on":      sr_gps_on,
+                    "train/spl_gps_on":     spl_gps_on,
+                    "train/reward_gps_on":  rw_gps_on,
+                    "train/sr_gps_off":     sr_gps_off,
+                    "train/spl_gps_off":    spl_gps_off,
+                    "train/reward_gps_off": rw_gps_off,
+                })

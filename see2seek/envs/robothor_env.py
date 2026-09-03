@@ -559,7 +559,7 @@ class RoboTHOREnv:
 
         done = self._num_steps >= self._effective_max_steps
         if done:
-            reward += self.cfg.env.failed_stop_penalty
+            reward += self.cfg.env.timeout_penalty
 
         info = self._build_info(success=False, done=done)
         info["move_success"] = (

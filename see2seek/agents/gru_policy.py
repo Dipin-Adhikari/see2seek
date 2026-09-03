@@ -229,6 +229,7 @@ class GRUActorCritic(nn.Module):
         egopose_input_dim: int = 4,
         egopose_embed_dim: int = 32,
         use_egopose: bool = True,
+        with_pointgoal: bool = False,
         memory_size: int = 64,
         memory_proj_dim: int = 128,
         actor_hidden_dim: int = 256,
@@ -247,6 +248,7 @@ class GRUActorCritic(nn.Module):
         self.pointgoal_embed_dim = pointgoal_embed_dim
         self.egopose_embed_dim = egopose_embed_dim
         self.use_egopose = use_egopose
+        self.with_pointgoal = with_pointgoal
         self.memory_size = memory_size
         self.memory_proj_dim = memory_proj_dim
         self.dino_cls_dim = dino_cls_dim
@@ -286,11 +288,12 @@ class GRUActorCritic(nn.Module):
             embedding_dim=num_action_embed,
         )
 
-        # ---- PointGoal embedding ----
-        self.pointgoal_proj = nn.Sequential(
-            nn.Linear(pointgoal_input_dim, pointgoal_embed_dim),
-            nn.ReLU(inplace=True),
-        )
+        # ---- PointGoal embedding (only when GPS is used) ----
+        if with_pointgoal:
+            self.pointgoal_proj = nn.Sequential(
+                nn.Linear(pointgoal_input_dim, pointgoal_embed_dim),
+                nn.ReLU(inplace=True),
+            )
 
         # ---- Ego-pose embedding (dead-reckoned position relative to start) ----
         if use_egopose:
@@ -304,7 +307,7 @@ class GRUActorCritic(nn.Module):
             obs_dim
             + goal_proj_dim
             + num_action_embed
-            + pointgoal_embed_dim
+            + (pointgoal_embed_dim if with_pointgoal else 0)
             + (egopose_embed_dim if use_egopose else 0)
         )
         self.policy_input_dim = self._base_input_dim + memory_proj_dim
@@ -332,12 +335,13 @@ class GRUActorCritic(nn.Module):
         self._init_weights()
 
         egopose_str = f", egopose={egopose_embed_dim}" if use_egopose else ""
+        pg_str = f", pointgoal={pointgoal_embed_dim}" if with_pointgoal else ""
         logger.info(
             f"GRUActorCritic [{obs_encoder_type}] — "
             f"policy_input_dim={self.policy_input_dim} "
             f"(obs={obs_dim}, goal_proj={goal_proj_dim}, "
             f"memory={memory_proj_dim}, "
-            f"prev_action={num_action_embed}, pointgoal={pointgoal_embed_dim}{egopose_str}), "
+            f"prev_action={num_action_embed}{pg_str}{egopose_str}), "
             f"GRU={num_recurrent_layers}x{hidden_size}, actions={num_actions}"
         )
 
@@ -379,10 +383,11 @@ class GRUActorCritic(nn.Module):
                 nn.init.orthogonal_(m.weight)
                 nn.init.zeros_(m.bias)
 
-        for m in self.pointgoal_proj.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
-                nn.init.zeros_(m.bias)
+        if self.with_pointgoal:
+            for m in self.pointgoal_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight)
+                    nn.init.zeros_(m.bias)
 
         if self.use_egopose:
             for m in self.egopose_proj.modules():
@@ -415,8 +420,6 @@ class GRUActorCritic(nn.Module):
             (B, base_input_dim)
         """
         prev_act_embed = self.prev_action_embed(prev_actions)
-        pointgoal_feat = self.pointgoal_proj(pointgoal)
-        pointgoal_feat = F.normalize(pointgoal_feat, p=2, dim=-1)
         goal_feat = self.goal_proj(goal_embed)
         goal_feat = F.normalize(goal_feat, p=2, dim=-1)
 
@@ -434,7 +437,11 @@ class GRUActorCritic(nn.Module):
 
         parts.append(goal_feat)
         parts.append(prev_act_embed)
-        parts.append(pointgoal_feat)
+
+        if self.with_pointgoal and pointgoal is not None:
+            pointgoal_feat = self.pointgoal_proj(pointgoal)
+            pointgoal_feat = F.normalize(pointgoal_feat, p=2, dim=-1)
+            parts.append(pointgoal_feat)
 
         # Add ego-pose as direct input (dead-reckoned position relative to start)
         if self.use_egopose and poses is not None:
@@ -690,7 +697,7 @@ class GRUActorCritic(nn.Module):
             obs_feat = F.normalize(self.obs_proj(cls_embed), p=2, dim=-1)
             norms["obs"] = obs_feat.norm(dim=-1).mean().item()
 
-        if pointgoal is not None:
+        if self.with_pointgoal and pointgoal is not None:
             pg_feat = F.normalize(self.pointgoal_proj(pointgoal), p=2, dim=-1)
             norms["pointgoal"] = pg_feat.norm(dim=-1).mean().item()
 
@@ -742,6 +749,7 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
         egopose_input_dim=getattr(enc, "egopose_input_dim", 4),
         egopose_embed_dim=getattr(enc, "egopose_embed_dim", 32),
         use_egopose=getattr(enc, "use_egopose", True),
+        with_pointgoal=getattr(enc, "with_pointgoal", False),
         memory_size=getattr(enc, "memory_size", 64),
         memory_proj_dim=getattr(enc, "memory_proj_dim", 128),
         actor_hidden_dim=pol.actor_hidden_dim,

@@ -80,19 +80,20 @@ class EnvConfig:
     success_reward: float = 10.0
     angle_success_reward: float = 5.0     # bonus for stopping within 1m AND facing goal heading (±25°)
     angle_success_threshold: float = 25.0 # degrees — max heading diff from goal for angle bonus
-    failed_stop_penalty: float = -1.0     # max penalty for calling Stop far from goal (shaped)
-    slack_reward: float = -0.01           # per-step cost (encourages efficiency)
-    geodesic_reward_scale: float = 2.0    # scale on geodesic-distance delta
+    failed_stop_penalty: float = -0.5     # max penalty for calling Stop far from goal (shaped)
+    timeout_penalty: float = -2.0         # terminal penalty when episode times out (max_steps)
+    slack_reward: float = -0.005          # per-step cost (encourages efficiency)
+    geodesic_reward_scale: float = 1.5    # scale on geodesic-distance delta
     angle_reward_scale: float = 1.0       # scale on angle-to-goal delta (only active within 1m)
     success_distance: float = 1.0         # metres; agent is "at goal" if closer
     collision_penalty: float = -0.01
-    rotation_penalty: float = -0.005      # fixed cost per rotation to prevent spinning
+    rotation_penalty: float = -0.002      # fixed cost per rotation to prevent spinning
     shaped_stop: bool = True              # if True, failed stop penalty scales with distance
 
     # --- Intrinsic exploration reward ---
-    exploration_bonus: float = 0.05        # reward for visiting a new grid cell
+    exploration_bonus: float = 0.10         # reward for visiting a new grid cell
     exploration_cell_size: float = 0.5     # grid cell size in metres
-    exploration_decay_steps: int = 3_000_000  # linearly decay bonus to 0 over this many env steps
+    exploration_decay_steps: int = 10_000_000  # linearly decay bonus to 0 over full training
 
     # --- Episode limits ---
     max_steps: int = 500
@@ -104,7 +105,7 @@ class EnvConfig:
     curriculum_enabled: bool = True
     curriculum_start_max_steps: int = 150           # max_steps at start of training
     curriculum_end_max_steps: int = 500             # max_steps at end of curriculum
-    curriculum_ramp_steps: int = 2_000_000          # env steps over which to ramp
+    curriculum_ramp_steps: int = 3_000_000          # env steps over which to ramp
 
     # --- Parallelism ---
     num_envs: int = 16                    # number of parallel rollout workers
@@ -162,7 +163,8 @@ class EncoderConfig:
     # --- PointGoal sensor embedding ---
     pointgoal_input_dim: int = 3           # [geodesic_dist, cos(angle), sin(angle)]
     pointgoal_embed_dim: int = 32          # projected dim of pointgoal sensor
-    pointgoal_dropout: float = 0.5         # probability of zeroing pointgoal (for ObjectNav transfer)
+    with_pointgoal: bool = False            # whether to include pointgoal sensor in GRU input
+    pointgoal_dropout: float = 0.0         # probability of zeroing pointgoal (for ObjectNav transfer)
 
     # --- Ego-pose sensor embedding (dead-reckoned position relative to start) ---
     egopose_input_dim: int = 4             # [x, y, cos(theta), sin(theta)]
@@ -176,14 +178,15 @@ class EncoderConfig:
     @property
     def policy_input_dim(self) -> int:
         egopose_dim = self.egopose_embed_dim if self.use_egopose else 0
+        pointgoal_dim = self.pointgoal_embed_dim if self.with_pointgoal else 0
         if self.obs_encoder_type == "clip":
             return (self.clip_obs_proj_dim + self.goal_embed_dim
-                    + self.action_embed_dim + self.pointgoal_embed_dim + egopose_dim)
+                    + self.action_embed_dim + pointgoal_dim + egopose_dim)
         else:
             cls_dim = self.cls_proj_dim if self.use_cls else 0
             return (self.spatial_compressed_dim + cls_dim + self.goal_proj_dim
                     + self.memory_proj_dim
-                    + self.action_embed_dim + self.pointgoal_embed_dim + egopose_dim)
+                    + self.action_embed_dim + pointgoal_dim + egopose_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +230,7 @@ class PPOConfig:
     # --- PPO clipping ---
     clip_param: float = 0.2
     value_loss_coef: float = 0.5
-    entropy_coef: float = 0.03            # entropy bonus (fallback / CLIP baseline)
+    entropy_coef: float = 0.05            # entropy bonus (used when with_pointgoal=False)
     entropy_coef_gps_on: float = 0.02     # entropy for steps with PointGoal active
     entropy_coef_gps_off: float = 0.08    # entropy for steps with PointGoal dropped (needs exploration)
 
@@ -260,8 +263,8 @@ class LoggingConfig:
     wandb_entity: Optional[str] = None    # set your W&B username here
     run_name: Optional[str] = None        # None → auto-generated
 
-    checkpoint_dir: str = "data_dino_v6/checkpoints"
-    log_dir: str = "data_dino_v6/logs"
+    checkpoint_dir: str = "data_dino_v7/checkpoints"
+    log_dir: str = "data_dino_v7/logs"
     video_dir: str = "videos"
 
 
@@ -273,10 +276,10 @@ class LoggingConfig:
 class DataConfig:
     """Dataset and caching paths."""
 
-    goal_cache_dir: str = "data_dino_v6/goal_datasets"
+    goal_cache_dir: str = "data_dino_v7/goal_datasets"
     # Pre-cached CLIP embeddings for ImageNav goal images
     # generated by tools/cache_goal_embeddings.py
-    goal_cache_file: str = "data_dino_v6/goal_datasets/imagenav_robothor_clip_vitb32.pkl"
+    goal_cache_file: str = "data_dino_v7/goal_datasets/imagenav_robothor_clip_vitb32.pkl"
 
 
 # ---------------------------------------------------------------------------
