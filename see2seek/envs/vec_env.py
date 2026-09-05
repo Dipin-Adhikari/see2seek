@@ -100,14 +100,13 @@ def _worker(
         pass
 
 
+_WORKER_DEAD_EXCEPTIONS = (BrokenPipeError, EOFError, ConnectionError, OSError)
+
+
 class VecEnv:
     def __init__(self, cfg, num_envs: Optional[int] = None) -> None:
         self.cfg = cfg
         self.num_envs = num_envs or cfg.env.num_envs
-
-        # Shapes — adjust image_size/goal_dim to match your actual config keys
-        img_size = cfg.env.image_width   # e.g. 224
-        goal_dim = 512
 
         self._parent_conns: List[mp.connection.Connection] = []
         self._processes: List[mp.Process] = []
@@ -115,53 +114,138 @@ class VecEnv:
         self._shared_goal: List[torch.Tensor] = []
         self._shared_pointgoal: List[torch.Tensor] = []
 
-        ctx = mp.get_context("spawn")
-
-        # Pull real dims from config instead of guessing
-        img_c = cfg.env.image_channels    # 3
-        img_h = cfg.env.image_height      # 224
-        img_w = cfg.env.image_width       # 224
-        goal_dim = cfg.encoder.goal_embed_dim   # 512 (CLIP ViT-B/32)
-        pointgoal_dim = cfg.encoder.pointgoal_input_dim  # 3
+        self._current_max_steps: Optional[int] = None
+        self._current_exploration_bonus: Optional[float] = None
 
         for i in range(self.num_envs):
-            rgb_buf = torch.zeros(img_c, img_h, img_w, dtype=torch.float32)
-            goal_buf = torch.zeros(goal_dim, dtype=torch.float32)
-            pointgoal_buf = torch.zeros(pointgoal_dim, dtype=torch.float32)
-            rgb_buf.share_memory_()
-            goal_buf.share_memory_()
-            pointgoal_buf.share_memory_()
-
-            parent_conn, child_conn = ctx.Pipe()
-            p = ctx.Process(
-                target=_worker,
-                args=(i, cfg, child_conn, parent_conn, rgb_buf, goal_buf, pointgoal_buf),
-                daemon=True,
-            )
-            p.start()
-            child_conn.close()
-
-            self._parent_conns.append(parent_conn)
-            self._processes.append(p)
-            self._shared_rgb.append(rgb_buf)
-            self._shared_goal.append(goal_buf)
-            self._shared_pointgoal.append(pointgoal_buf)
+            conn, proc, rgb, goal, pg = self._create_worker(i)
+            self._parent_conns.append(conn)
+            self._processes.append(proc)
+            self._shared_rgb.append(rgb)
+            self._shared_goal.append(goal)
+            self._shared_pointgoal.append(pg)
 
         logger.info(f"VecEnv: {self.num_envs} worker processes started (persistent shared buffers)")
 
+    def _create_worker(
+        self, worker_id: int
+    ) -> Tuple[mp.connection.Connection, mp.Process, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        img_c = cfg.env.image_channels
+        img_h = cfg.env.image_height
+        img_w = cfg.env.image_width
+        goal_dim = cfg.encoder.goal_embed_dim
+        pointgoal_dim = cfg.encoder.pointgoal_input_dim
+
+        rgb_buf = torch.zeros(img_c, img_h, img_w, dtype=torch.float32)
+        goal_buf = torch.zeros(goal_dim, dtype=torch.float32)
+        pointgoal_buf = torch.zeros(pointgoal_dim, dtype=torch.float32)
+        rgb_buf.share_memory_()
+        goal_buf.share_memory_()
+        pointgoal_buf.share_memory_()
+
+        ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(
+            target=_worker,
+            args=(worker_id, cfg, child_conn, parent_conn, rgb_buf, goal_buf, pointgoal_buf),
+            daemon=True,
+        )
+        p.start()
+        child_conn.close()
+        return parent_conn, p, rgb_buf, goal_buf, pointgoal_buf
+
+    def _respawn_worker(self, i: int) -> None:
+        logger.warning(f"VecEnv: respawning dead worker {i}")
+
+        old_proc = self._processes[i]
+        if old_proc.is_alive():
+            old_proc.terminate()
+        old_proc.join(timeout=5)
+        if old_proc.is_alive():
+            old_proc.kill()
+            old_proc.join(timeout=2)
+
+        try:
+            self._parent_conns[i].close()
+        except Exception:
+            pass
+
+        conn, proc, rgb, goal, pg = self._create_worker(i)
+        self._parent_conns[i] = conn
+        self._processes[i] = proc
+        self._shared_rgb[i] = rgb
+        self._shared_goal[i] = goal
+        self._shared_pointgoal[i] = pg
+
+        conn.send(("reset",))
+        conn.recv()
+
+        if self._current_max_steps is not None:
+            conn.send(("set_max_steps", self._current_max_steps))
+            conn.recv()
+        if self._current_exploration_bonus is not None:
+            conn.send(("set_exploration_bonus", self._current_exploration_bonus))
+            conn.recv()
+
+        logger.info(f"VecEnv: worker {i} respawned successfully")
+
     def reset_all(self) -> Dict[str, torch.Tensor]:
-        for conn in self._parent_conns:
-            conn.send(("reset",))
-        self._recv_all()  # just "ok" acks — data is already in shared buffers
+        dead = set()
+        for i, conn in enumerate(self._parent_conns):
+            try:
+                conn.send(("reset",))
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+
+        for i, conn in enumerate(self._parent_conns):
+            if i in dead:
+                continue
+            try:
+                conn.recv()
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+
+        for i in dead:
+            self._respawn_worker(i)
+
         return self._stack_obs()
 
     def step(
         self, actions: torch.Tensor
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, List[Dict]]:
-        for conn, action in zip(self._parent_conns, actions.tolist()):
-            conn.send(("step", action))
+        dead: set = set()
 
-        results = self._recv_all()  # [("ok", reward, done, info), ...]
+        for i, (conn, action) in enumerate(zip(self._parent_conns, actions.tolist())):
+            try:
+                conn.send(("step", action))
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+
+        results: List[Any] = [None] * self.num_envs
+        for i, conn in enumerate(self._parent_conns):
+            if i in dead:
+                continue
+            try:
+                result = conn.recv()
+                if isinstance(result, tuple) and len(result) >= 3 and result[0] == "__error__":
+                    dead.add(i)
+                else:
+                    results[i] = result
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+
+        for i in dead:
+            logger.error(
+                f"VecEnv: worker {i} died (Unity segfault or crash), respawning..."
+            )
+            self._respawn_worker(i)
+            results[i] = ("ok", 0.0, True, {
+                "success": False, "done": True, "num_steps": 0,
+                "episode_id": "crashed", "scene_id": "unknown",
+                "collisions": 0, "controller_crashed": True,
+            })
+
         rewards = torch.tensor([r[1] for r in results], dtype=torch.float32)
         dones   = torch.tensor([r[2] for r in results], dtype=torch.bool)
         infos   = [r[3] for r in results]
@@ -170,15 +254,13 @@ class VecEnv:
 
     def set_max_steps(self, max_steps: int) -> None:
         """Update effective max_steps on all worker environments (curriculum)."""
-        for conn in self._parent_conns:
-            conn.send(("set_max_steps", max_steps))
-        self._recv_all()
+        self._current_max_steps = max_steps
+        self._send_recv_all("set_max_steps", max_steps)
 
     def set_exploration_bonus(self, bonus: float) -> None:
         """Update exploration bonus on all worker environments (decay)."""
-        for conn in self._parent_conns:
-            conn.send(("set_exploration_bonus", bonus))
-        self._recv_all()
+        self._current_exploration_bonus = bonus
+        self._send_recv_all("set_exploration_bonus", bonus)
 
     def close(self) -> None:
         for conn in self._parent_conns:
@@ -192,23 +274,22 @@ class VecEnv:
                 p.terminate()
         logger.info("VecEnv: all workers closed")
 
-    def _recv_all(self) -> List[Any]:
-        results = []
+    def _send_recv_all(self, cmd: str, *args: Any) -> None:
+        dead: set = set()
         for i, conn in enumerate(self._parent_conns):
             try:
-                result = conn.recv()
-            except EOFError as e:
-                raise RuntimeError(
-                    f"VecEnv: worker {i} pipe closed unexpectedly (process likely "
-                    f"crashed). Check the worker's own stderr/log output above."
-                ) from e
-
-            if isinstance(result, tuple) and len(result) == 3 and result[0] == "__error__":
-                _, worker_id, message = result
-                raise RuntimeError(f"VecEnv: worker {worker_id} reported an error: {message}")
-
-            results.append(result)
-        return results
+                conn.send((cmd, *args))
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+        for i, conn in enumerate(self._parent_conns):
+            if i in dead:
+                continue
+            try:
+                conn.recv()
+            except _WORKER_DEAD_EXCEPTIONS:
+                dead.add(i)
+        for i in dead:
+            self._respawn_worker(i)
 
     def _stack_obs(self) -> Dict[str, torch.Tensor]:
         # Read directly out of the persistent shared buffers — zero-copy,

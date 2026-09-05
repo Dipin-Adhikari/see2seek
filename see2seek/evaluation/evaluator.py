@@ -132,6 +132,8 @@ class Evaluator:
         spls = []
         all_steps = []
         all_collisions = []
+        all_path_lengths = []
+        all_shortest_path_lengths = []
 
         # Launch parallel environments
         vec_env = make_vec_envs(self.cfg, num_envs=self.num_envs)
@@ -238,17 +240,21 @@ class Evaluator:
                     ep_id = info.get("episode_id", "?")
                     scene_id = info.get("scene_id", "?")
                     collisions = info.get("collisions", 0)
+                    path_len = info.get("path_length", 0.0)
+                    sp_len = info.get("shortest_path_length", 0.0)
 
                     successes.append(int(success))
                     spls.append(spl)
                     all_steps.append(ep_steps)
                     all_collisions.append(collisions)
+                    all_path_lengths.append(path_len)
+                    all_shortest_path_lengths.append(sp_len)
                     episode_count += 1
 
                     eval_logger.info(
                         f"[ep {episode_count:4d}] scene={scene_id} id={ep_id} "
                         f"success={success} steps={ep_steps} collisions={collisions} "
-                        f"spl={spl:.3f}"
+                        f"spl={spl:.3f} path={path_len:.2f} shortest={sp_len:.2f}"
                     )
 
                     if episode_count % 50 == 0:
@@ -278,10 +284,13 @@ class Evaluator:
 
         # Final results
         elapsed = time.time() - start_time
-        sr = sum(successes) / max(len(successes), 1)
-        spl_mean = sum(spls) / max(len(spls), 1)
-        mean_steps = sum(all_steps) / max(len(all_steps), 1)
-        mean_collisions = sum(all_collisions) / max(len(all_collisions), 1)
+        n = max(len(successes), 1)
+        sr = sum(successes) / n
+        spl_mean = sum(spls) / n
+        mean_steps = sum(all_steps) / n
+        mean_collisions = sum(all_collisions) / n
+        mean_path = sum(all_path_lengths) / n
+        mean_sp = sum(all_shortest_path_lengths) / n
 
         result = {
             "sr": round(sr, 4),
@@ -289,6 +298,8 @@ class Evaluator:
             "num_episodes": episode_count,
             "mean_steps": round(mean_steps, 1),
             "mean_collisions": round(mean_collisions, 1),
+            "mean_path_length": round(mean_path, 2),
+            "mean_shortest_path": round(mean_sp, 2),
             "total_time_s": round(elapsed, 1),
             "eps_per_sec": round(episode_count / max(elapsed, 1), 2),
         }
@@ -299,8 +310,49 @@ class Evaluator:
         eval_logger.info(f"  SPL:            {spl_mean:.4f}")
         eval_logger.info(f"  Mean steps:     {mean_steps:.1f}")
         eval_logger.info(f"  Mean collisions:{mean_collisions:.1f}")
+        eval_logger.info(f"  Mean path:      {mean_path:.2f}m (travelled)")
+        eval_logger.info(f"  Mean shortest:  {mean_sp:.2f}m (oracle)")
         eval_logger.info(f"  Time:           {elapsed:.1f}s ({result['eps_per_sec']:.2f} eps/s)")
         eval_logger.info(f"  Log saved:      {log_file}")
+
+        # Breakdown by difficulty (shortest path length buckets)
+        easy, medium, hard = [], [], []
+        easy_sr, medium_sr, hard_sr = [], [], []
+        for i, sp in enumerate(all_shortest_path_lengths):
+            if sp < 3.0:
+                easy.append(i)
+                easy_sr.append(successes[i])
+            elif sp < 7.0:
+                medium.append(i)
+                medium_sr.append(successes[i])
+            else:
+                hard.append(i)
+                hard_sr.append(successes[i])
+
+        eval_logger.info(f"\n=== Difficulty Breakdown (by shortest path length) ===")
+        for label, indices, sr_list in [
+            ("Easy (<3m)", easy, easy_sr),
+            ("Medium (3-7m)", medium, medium_sr),
+            ("Hard (>7m)", hard, hard_sr),
+        ]:
+            if indices:
+                bucket_sr = sum(sr_list) / len(sr_list)
+                bucket_spl = sum(spls[j] for j in indices) / len(indices)
+                bucket_path = sum(all_path_lengths[j] for j in indices) / len(indices)
+                bucket_sp = sum(all_shortest_path_lengths[j] for j in indices) / len(indices)
+                eval_logger.info(
+                    f"  {label:16s}: n={len(indices):4d} SR={bucket_sr:.3f} "
+                    f"SPL={bucket_spl:.3f} path={bucket_path:.1f}m shortest={bucket_sp:.1f}m"
+                )
+            else:
+                eval_logger.info(f"  {label:16s}: n=   0")
+
+        result["easy_sr"] = round(sum(easy_sr) / max(len(easy_sr), 1), 4)
+        result["medium_sr"] = round(sum(medium_sr) / max(len(medium_sr), 1), 4)
+        result["hard_sr"] = round(sum(hard_sr) / max(len(hard_sr), 1), 4)
+        result["easy_n"] = len(easy)
+        result["medium_n"] = len(medium)
+        result["hard_n"] = len(hard)
 
         # Cleanup logger
         eval_logger.removeHandler(file_handler)

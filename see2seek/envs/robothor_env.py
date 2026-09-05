@@ -796,6 +796,8 @@ class RoboTHOREnv:
             "episode_id": self._current_episode.get("id", "?"),
             "scene_id": self._current_episode.get("scene", "?"),
             "collisions": self._episode_collisions,
+            "path_length": round(self._path_length, 3),
+            "shortest_path_length": round(self._shortest_path_length, 3),
         }
 
     def set_max_steps(self, max_steps: int) -> None:
