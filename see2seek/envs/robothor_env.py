@@ -62,6 +62,7 @@ import json
 import logging
 import os
 import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -189,21 +190,22 @@ class RoboTHOREnv:
         )
 
     def _init_controller(self) -> None:
-        """Start the AI2-THOR Unity engine backend wrapper."""
+        """Start the AI2-THOR Unity engine backend wrapper.
+
+        Attempts GPU-accelerated CloudRendering first. If the Vulkan
+        render server fails to produce a frame (e.g. missing NVIDIA
+        Vulkan ICD — llvmpipe fallback can't render AI2-THOR scenes),
+        falls back to the default CPU renderer automatically.
+        """
         try:
             from ai2thor.controller import Controller
-            # Import CloudRendering to support true headless execution if needed
             from ai2thor.platform import CloudRendering
         except ImportError as e:
             raise ImportError("ai2thor is required: pip install ai2thor") from e
 
-        # Use CloudRendering if headless=True, otherwise let it open normally
-        platform_setting = CloudRendering if (not self._render) else None
-
-        self._controller = Controller(
-            agentMode="locobot",  # must be "locobot" for RoboTHOR scenes
+        base_kwargs = dict(
+            agentMode="locobot",
             visibilityDistance=1.5,
-            #scene="FloorPlan_Train1_1",
             gridSize=self.cfg.env.move_magnitude,
             rotateStepDegrees=self.cfg.env.rotate_degrees,
             snapToGrid=False,
@@ -213,10 +215,48 @@ class RoboTHOREnv:
             height=self.cfg.env.image_height,
             fieldOfView=79,
             port=8200 + self._worker_id,
-            # headless=(not self._render),
-            # gpu_device=0,
-            # platform=platform_setting,
         )
+
+        skip_cloud = os.environ.get("SEE2SEEK_NO_CLOUD_RENDERING", "")
+        if not self._render and not skip_cloud and not getattr(self, "_cloud_rendering_broken", False):
+            try:
+                self._controller = Controller(
+                    **base_kwargs,
+                    headless=True,
+                    gpu_device=0,
+                    platform=CloudRendering,
+                )
+                event = self._controller.reset(scene="FloorPlan_Train1_1")
+                for _ in range(10):
+                    if event.frame is not None:
+                        break
+                    time.sleep(0.5)
+                    event = self._controller.step(action="Pass")
+                if event.frame is not None:
+                    logger.info(
+                        f"RoboTHOREnv[{self._worker_id}] using CloudRendering (GPU Vulkan)"
+                    )
+                    return
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] CloudRendering produced no frame "
+                    f"— falling back to default (CPU) renderer. "
+                    f"Install NVIDIA Vulkan ICD for GPU rendering: "
+                    f"sudo apt install libnvidia-vulkan-icd"
+                )
+                self._controller.stop()
+            except Exception as e:
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] CloudRendering init failed: {e} "
+                    f"— falling back to default (CPU) renderer"
+                )
+                if self._controller is not None:
+                    try:
+                        self._controller.stop()
+                    except Exception:
+                        pass
+            self._cloud_rendering_broken = True
+
+        self._controller = Controller(**base_kwargs)
 
     def _restart_controller(self) -> None:
         """
@@ -354,12 +394,13 @@ class RoboTHOREnv:
                 # 1. Reset simulator framework window state target
                 event = self._controller.reset(scene=scene)
 
-                # CloudRendering can return a None frame on the very first event while
-                # the render server is still warming up (common on weaker/laptop GPUs).
-                # Force a few no-op steps until a real frame comes back.
+                # CloudRendering's Vulkan render server can take several seconds
+                # to warm up, especially when many workers start simultaneously.
+                # Poll with exponential backoff until a real frame arrives.
                 retries = 0
-                max_retries = 5
+                max_retries = 30
                 while event.frame is None and retries < max_retries:
+                    time.sleep(min(0.2 * (1.3 ** retries), 2.0))
                     event = self._controller.step(action="Pass")
                     retries += 1
 
@@ -368,6 +409,8 @@ class RoboTHOREnv:
                     logger.warning(f"{last_error} — skipping to next episode")
                     attempt += 1
                     continue
+                elif retries > 0:
+                    logger.info(f"RoboTHOREnv[{self._worker_id}] renderer warmed up after {retries} retries (scene={scene})")
 
                 # 2. Build rotation payload matching AI2-THOR API parameters (Yaw mapping)
                 start_rotation = {"x": 0, "y": ep.get("initial_orientation", 0.0), "z": 0}

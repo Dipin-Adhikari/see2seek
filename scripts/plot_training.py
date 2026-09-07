@@ -11,13 +11,16 @@ def parse_log(log_path):
     metrics = {
         "steps": [], "update": [],
         "policy_loss": [], "value_loss": [], "entropy": [],
-        "reward": [], "SR": [], "SPL": [], "fps": [],
+        "reward": [], "SR": [], "SPL": [], "avg_steps": [], "fps": [],
     }
     actions = {
         "steps": [],
         "MoveAhead": [], "RotateLeft": [], "RotateRight": [], "Stop": [],
     }
 
+    # Handles both the old format (...SPL=x.xxx fps=xx) and the current
+    # format, which inserts avg_steps=N between SPL and fps, and may have
+    # a trailing max_steps=N field.
     update_pattern = re.compile(
         r"\[\s*([\d,]+)\s*steps\s*\|\s*update\s+(\d+)\]\s*"
         r"policy_loss=([\-\d.]+)\s+"
@@ -26,7 +29,9 @@ def parse_log(log_path):
         r"reward=([\-\d.]+)\s+"
         r"SR=([\d.]+)\s+"
         r"SPL=([\d.]+)\s+"
+        r"(?:avg_steps=(\d+)\s+)?"
         r"fps=(\d+)"
+        r"(?:\s+max_steps=\d+)?"
     )
 
     action_pattern = re.compile(
@@ -48,7 +53,10 @@ def parse_log(log_path):
                 metrics["reward"].append(float(m.group(6)))
                 metrics["SR"].append(float(m.group(7)))
                 metrics["SPL"].append(float(m.group(8)))
-                metrics["fps"].append(int(m.group(9)))
+                metrics["avg_steps"].append(
+                    int(m.group(9)) if m.group(9) is not None else None
+                )
+                metrics["fps"].append(int(m.group(10)))
                 continue
 
             m = action_pattern.search(line)
@@ -72,7 +80,7 @@ def merge_logs(log_files):
     merged_metrics = {
         "steps": [], "update": [],
         "policy_loss": [], "value_loss": [], "entropy": [],
-        "reward": [], "SR": [], "SPL": [], "fps": [],
+        "reward": [], "SR": [], "SPL": [], "avg_steps": [], "fps": [],
     }
     merged_actions = {
         "steps": [],
@@ -87,13 +95,19 @@ def merge_logs(log_files):
             continue
 
         # Offset steps so each subsequent file's steps continue from where
-        # the previous one left off (handles resumed-training logs where
-        # each run restarts its own step counter at/near 0).
+        # the previous one left off. This only applies to logs that
+        # genuinely restart their own step counter near 0 (e.g. a fresh
+        # run started independently of a checkpoint). A log resumed from a
+        # checkpoint may start slightly *before* the previous file's last
+        # step (crash/restart from an earlier checkpoint) - that is NOT a
+        # restart-from-zero and must not be offset, or steps get inflated
+        # every time this happens.
         step_offset = merged_metrics["steps"][-1] if merged_metrics["steps"] else 0
-        if metrics["steps"][0] < step_offset:
+        first_step = metrics["steps"][0]
+        if step_offset > 0 and first_step < step_offset * 0.1:
             offset = step_offset
         else:
-            offset = 0  # steps already continue naturally (e.g. same run split across files)
+            offset = 0
 
         for key in merged_metrics:
             if key == "steps":
@@ -108,7 +122,33 @@ def merge_logs(log_files):
                 merged_actions[key].extend(actions[key])
 
         print(f"  {log_path.name}: {len(metrics['steps'])} updates "
-              f"({metrics['steps'][0]:,} -> {metrics['steps'][-1]:,})")
+              f"({metrics['steps'][0]:,} -> {metrics['steps'][-1]:,})"
+              + (f"  [offset +{offset:,}]" if offset else ""))
+
+    # Sort by step and drop any duplicate/out-of-order points that can
+    # occur when consecutive logs have slightly overlapping step ranges
+    # (e.g. a resume from a checkpoint a bit earlier than the last
+    # recorded update of the previous log).
+    if merged_metrics["steps"]:
+        order = sorted(range(len(merged_metrics["steps"])),
+                        key=lambda i: merged_metrics["steps"][i])
+        for key in merged_metrics:
+            merged_metrics[key] = [merged_metrics[key][i] for i in order]
+
+        dedup_idx = []
+        last_step = None
+        for i, s in enumerate(merged_metrics["steps"]):
+            if s != last_step:
+                dedup_idx.append(i)
+                last_step = s
+        for key in merged_metrics:
+            merged_metrics[key] = [merged_metrics[key][i] for i in dedup_idx]
+
+    if merged_actions["steps"]:
+        order = sorted(range(len(merged_actions["steps"])),
+                        key=lambda i: merged_actions["steps"][i])
+        for key in merged_actions:
+            merged_actions[key] = [merged_actions[key][i] for i in order]
 
     return merged_metrics, merged_actions
 
@@ -217,7 +257,7 @@ if __name__ == "__main__":
         cfg = Config()
         log_dir = Path(cfg.logging.log_dir)
 
-    log_files = sorted(log_dir.glob("train_*.log"))
+    log_files = sorted(log_dir.glob("train/train_*.log"))
 
     if not log_files:
         print(f"No log files found in {log_dir}/")

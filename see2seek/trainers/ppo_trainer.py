@@ -256,12 +256,16 @@ class PPOTrainer:
             # ---- Phase 1: Collect rollout ----
             self.policy.eval()    # eval for rollout (no dropout)
             collect_start = time.time()
+            _t_encode = 0.0
+            _t_policy = 0.0
+            _t_step = 0.0
 
             for _ in range(cfg.ppo.num_steps):
                 with torch.no_grad():
                     rgb = obs_dict["rgb"].to(self.device)  # (N, 3, H, W)
 
                     # 1a. Encode observation (frozen backbone)
+                    _t0 = time.time()
                     if self.obs_encoder_type == "dino":
                         cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
                     else:
@@ -270,6 +274,8 @@ class PPOTrainer:
 
                     # 1b. Encode goal (CLIP — frozen; cached)
                     goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
+                    torch.cuda.synchronize()
+                    _t_encode += time.time() - _t0
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
 
@@ -283,6 +289,7 @@ class PPOTrainer:
                         pg_dropped = None
 
                     # 1d. Policy forward (with position-augmented episodic memory)
+                    _t0 = time.time()
                     dist, value, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                         patch_embed, cls_embed, goal_embed, prev_actions,
                         hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
@@ -291,12 +298,16 @@ class PPOTrainer:
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
+                    torch.cuda.synchronize()
+                    _t_policy += time.time() - _t0
 
                 # Bug 2 fix: snapshot pre-step pose (what the policy actually saw)
                 pose_for_buffer = agent_poses.clone()
 
                 # 1d. Step environments
+                _t0 = time.time()
                 obs_dict, rewards, dones, infos = self.vec_env.step(actions)
+                _t_step += time.time() - _t0
                 rewards = rewards.to(self.device)
 
                 # Dead-reckon pose update (vectorized)
@@ -457,6 +468,13 @@ class PPOTrainer:
             # ---- Logging ----
             if self._num_updates % cfg.ppo.log_interval == 0:
                 self._log(update_metrics, collect_start)
+                collect_total = _t_encode + _t_policy + _t_step
+                if collect_total > 0:
+                    logger.info(
+                        f"    timing — encode={_t_encode:.1f}s ({100*_t_encode/collect_total:.0f}%)  "
+                        f"policy={_t_policy:.1f}s ({100*_t_policy/collect_total:.0f}%)  "
+                        f"env_step={_t_step:.1f}s ({100*_t_step/collect_total:.0f}%)"
+                    )
 
             # ---- Checkpointing ----
             if self._total_steps % cfg.ppo.checkpoint_interval < (

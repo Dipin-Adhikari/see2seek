@@ -225,9 +225,10 @@ class DINOv2Encoder(nn.Module):
         """
         self._shape_guard(rgb)
         rgb = self._norm(rgb.to(self.device))
-        features = self._backbone.forward_features(rgb)
-        cls_token: torch.Tensor = features["x_norm_clstoken"]       # (B, 768)
-        patch_tokens: torch.Tensor = features["x_norm_patchtokens"]  # (B, 256, 768)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            features = self._backbone.forward_features(rgb)
+        cls_token: torch.Tensor = features["x_norm_clstoken"].float()       # (B, 768)
+        patch_tokens: torch.Tensor = features["x_norm_patchtokens"].float()  # (B, 256, 768)
         return cls_token, patch_tokens
 
     # ------------------------------------------------------------------

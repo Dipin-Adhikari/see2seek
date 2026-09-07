@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -41,6 +42,13 @@ def _worker(
     shared_goal: torch.Tensor,      # pre-shared (512,) buffer for this worker
     shared_pointgoal: torch.Tensor, # pre-shared (3,) buffer for this worker
 ) -> None:
+    import os
+    os.environ["SEE2SEEK_NO_CLOUD_RENDERING"] = "1"
+    if "VK_ICD_FILENAMES" not in os.environ:
+        icd = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        if os.path.exists(icd):
+            os.environ["VK_ICD_FILENAMES"] = icd
+
     parent_conn.close()
 
     env = RoboTHOREnv(cfg, worker_id=worker_id)
@@ -124,6 +132,8 @@ class VecEnv:
             self._shared_rgb.append(rgb)
             self._shared_goal.append(goal)
             self._shared_pointgoal.append(pg)
+            if i < self.num_envs - 1:
+                time.sleep(1.0)
 
         logger.info(f"VecEnv: {self.num_envs} worker processes started (persistent shared buffers)")
 
