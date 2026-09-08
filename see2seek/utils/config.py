@@ -62,6 +62,9 @@ class EnvConfig:
     scene_dataset_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train"
     episodes_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train/episodes"
 
+    # scene_dataset_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/val"
+    # episodes_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/val/episodes"
+
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
     image_height: int = 224
