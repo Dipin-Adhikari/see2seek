@@ -28,11 +28,36 @@ All encoders (DINOv2 ViT-B/14, CLIP ViT-B/32) are frozen. Only the spatial CNN, 
 
 | | |
 |:---:|:---:|
-| ![Bowl navigation](docs/images/trajectory_FloorPlan_Val2_4_Bowl_2.png) | ![Laptop navigation](docs/images/trajectory_FloorPlan_Val2_2_Laptop_5.png) |
-| ![SprayBottle navigation](docs/images/trajectory_FloorPlan_Val1_5_SprayBottle_4.png) | ![Mug navigation](docs/images/trajectory_FloorPlan_Val2_2_Mug_5.png) |
-| ![Laptop navigation 2](docs/images/trajectory_FloorPlan_Val2_2_Laptop_1.png) | ![Bowl navigation 2](docs/images/trajectory_FloorPlan_Val3_4_Bowl_7.png) |
+| ![Bowl](docs/images/trajectory_FloorPlan_Val2_4_Bowl_2.png) Bowl | ![Laptop](docs/images/trajectory_FloorPlan_Val2_2_Laptop_5.png) Laptop |
+| ![SprayBottle](docs/images/trajectory_FloorPlan_Val1_5_SprayBottle_4.png) SprayBottle | ![Mug](docs/images/trajectory_FloorPlan_Val2_2_Mug_5.png) Mug |
+| ![HousePlant](docs/images/trajectory_FloorPlan_Val1_1_HousePlant_3.png) HousePlant | ![BasketBall](docs/images/trajectory_FloorPlan_Val3_5_BasketBall_4.png) BasketBall |
+| ![Laptop](docs/images/trajectory_FloorPlan_Val2_2_Laptop_1.png) Laptop | ![Bowl](docs/images/trajectory_FloorPlan_Val3_4_Bowl_7.png) Bowl |
 
-Green paths = successful trials, red = failed. Dark green = oracle shortest path. White circle = start, red circle = goal.
+Green paths = successful trials, red = failed. Light green = oracle shortest path. White circle with green boundary = start, red circle with black boundary = goal, green circle with white boundary = agent stop position when succeed, red circle with white boundary = agent stop when failed.
+
+## Evaluation Results
+
+Trained for 10M steps. Difficulty defined by oracle shortest path: easy (<=3m), medium (3-6m), hard (>6m).
+
+### ImageNav
+
+| Difficulty | Episodes | SR (%) | SPL |
+|-----------|----------|--------|-----|
+| **Overall** | **1740** | **15.4** | **0.094** |
+| Easy (<=3m) | 861 | 23.1 | 0.126 |
+| Medium (3-6m) | 633 | 8.7 | 0.071 |
+| Hard (>6m) | 246 | 5.7 | 0.042 |
+
+### ObjectNav (Zero-Shot)
+
+| Difficulty | Episodes | SR (%) | SPL |
+|-----------|----------|--------|-----|
+| **Overall** | **1740** | **17.0** | **0.108** |
+| Easy (<=3m) | 836 | 27.4 | 0.159 |
+| Medium (3-6m) | 649 | 8.2 | 0.069 |
+| Hard (>6m) | 255 | 5.1 | 0.040 |
+
+**Note:** ObjectNav's higher overall SR (17.0% vs 15.4%) is driven almost entirely by easy episodes (27.4% SR). On medium and hard episodes, ObjectNav performs worse than ImageNav (8.2%/5.1% vs 8.7%/5.7%), indicating the agent exploits short-distance episodes where CLIP text-to-vision alignment happens to work well, but struggles with longer-distance navigation that requires sustained goal-directed behavior.
 
 ## Reward Function
 
@@ -53,14 +78,11 @@ Angle-to-goal shaping is only active within 1m of the goal, encouraging the agen
 ## Training
 
 ```bash
-# Train (DINOv2 obs encoder, no GPS)
+# Train (DINOv2 obs encoder)
 python scripts/train.py
 
-# Train with PointGoal sensor
-python scripts/train.py --with_pointgoal
-
 # Resume from checkpoint
-python scripts/train.py --resume data_dino_v7/checkpoints/checkpoint_xxxxxx.pth
+python scripts/train.py --resume data_dino_v7/checkpoints/checkpoint_000010000000.pth
 
 # Debug mode (2 envs, 2 updates, no W&B)
 python scripts/train.py --debug
@@ -85,7 +107,7 @@ python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pt
 python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth --task objectnav
 ```
 
-Evaluation logs per-episode path length and shortest path length, with a difficulty breakdown (easy <3m, medium 3-7m, hard >7m).
+Evaluation logs per-episode path length and shortest path length, with a difficulty breakdown (easy <=3m, medium 3-6m, hard >6m).
 
 ### Metrics
 
