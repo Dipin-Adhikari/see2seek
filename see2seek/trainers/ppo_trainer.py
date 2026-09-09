@@ -251,6 +251,7 @@ class PPOTrainer:
             if cfg.env.exploration_decay_steps > 0 and cfg.env.exploration_bonus > 0:
                 decay_progress = min(self._total_steps / cfg.env.exploration_decay_steps, 1.0)
                 curr_bonus = cfg.env.exploration_bonus * (1.0 - decay_progress)
+                curr_bonus = max(curr_bonus, cfg.env.exploration_bonus_floor)
                 self.vec_env.set_exploration_bonus(curr_bonus)
 
             # ---- Phase 1: Collect rollout ----

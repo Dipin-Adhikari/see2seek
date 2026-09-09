@@ -95,8 +95,9 @@ class EnvConfig:
 
     # --- Intrinsic exploration reward ---
     exploration_bonus: float = 0.10         # reward for visiting a new grid cell
+    exploration_bonus_floor: float = 0.015  # minimum bonus after decay (residual curiosity)
     exploration_cell_size: float = 0.5     # grid cell size in metres
-    exploration_decay_steps: int = 10_000_000  # linearly decay bonus to 0 over full training
+    exploration_decay_steps: int = 10_000_000  # linearly decay bonus to floor over training
 
     # --- Episode limits ---
     max_steps: int = 500
