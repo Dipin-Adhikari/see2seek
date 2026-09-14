@@ -89,6 +89,9 @@ class RecurrentBatch(NamedTuple):
     can_stop:           torch.Tensor    # (chunk_len * num_chunks,)
     pointgoals:         torch.Tensor    # (chunk_len * num_chunks, 3)
     pointgoal_dropped:  torch.Tensor    # (chunk_len * num_chunks,) bool
+    memory_buffer:     Optional[torch.Tensor]
+    memory_pose_buffer: Optional[torch.Tensor]
+    memory_mask:       Optional[torch.Tensor]
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +140,7 @@ class RolloutBuffer:
         num_recurrent_layers: int = 2,
         storage_device: Optional[torch.device] = None,
         store_dtype: torch.dtype = torch.float16,
+        chunk_len: int = 32,
     ) -> None:
         self.num_steps = num_steps
         self.num_envs = num_envs
@@ -151,6 +155,12 @@ class RolloutBuffer:
         self.num_recurrent_layers = num_recurrent_layers
         self.storage_device = storage_device if storage_device is not None else device
         self.store_dtype = store_dtype
+        if num_steps < 1 or num_envs < 1 or chunk_len < 1:
+            raise ValueError("num_steps, num_envs, and chunk_len must be positive")
+        self.chunk_len = min(chunk_len, num_steps)
+        if num_steps % self.chunk_len:
+            raise ValueError("num_steps must be divisible by chunk_len")
+        self._memory_snapshots = {}
 
         self._step = 0   # current insertion pointer
 
@@ -267,7 +277,7 @@ class RolloutBuffer:
         self.masks[t+1]          = mask
         self.values[t]           = value.view(self.num_envs).detach()
         self.log_probs[t]        = log_prob.detach()
-        self.hidden_states[t+1]  = hidden.detach()   # hidden AFTER this step
+        self.hidden_states[t]    = hidden.detach()   # hidden BEFORE this step
         self.can_stop[t]         = can_stop
         if pointgoal is not None:
             self.pointgoals[t] = pointgoal.detach().to(device=self.device)
@@ -277,6 +287,16 @@ class RolloutBuffer:
             self.poses[t] = pose.detach().to(device=self.device)
 
         self._step += 1
+
+    def capture_memory(self, memory_buffer, memory_pose_buffer, memory_mask) -> None:
+        """Save only chunk-boundary memory, before the policy consumes a frame."""
+        if memory_buffer is None:
+            return
+        if self._step % self.chunk_len == 0:
+            self._memory_snapshots[self._step] = tuple(
+                tensor.detach().to(self.storage_device).clone()
+                for tensor in (memory_buffer, memory_pose_buffer, memory_mask)
+            )
 
     def after_update(self, last_hidden: torch.Tensor, last_mask: torch.Tensor) -> None:
         """
@@ -292,6 +312,7 @@ class RolloutBuffer:
         self.hidden_states[0] = last_hidden.detach()
         self.masks[0]         = last_mask.detach()
         self._step = 0
+        self._memory_snapshots.clear()
 
     # ------------------------------------------------------------------
     # Return / advantage computation
@@ -335,7 +356,7 @@ class RolloutBuffer:
         # Normalise advantages for training stability
         adv_flat = self.advantages[:self.num_steps].reshape(-1)
         self.advantages[:self.num_steps] = (
-            (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+            (adv_flat - adv_flat.mean()) / (adv_flat.std(unbiased=False) + 1e-8)
         ).reshape(self.num_steps, self.num_envs)
 
     # ------------------------------------------------------------------
@@ -345,7 +366,7 @@ class RolloutBuffer:
     def recurrent_mini_batches(
         self,
         num_mini_batches: int,
-        chunk_len: int = 32,
+        chunk_len: Optional[int] = None,
     ) -> Generator[RecurrentBatch, None, None]:
         """
         Yield mini-batches suitable for recurrent PPO updates.
@@ -364,6 +385,9 @@ class RolloutBuffer:
             storage_device == device already).
         """
         T, N = self.num_steps, self.num_envs
+        chunk_len = self.chunk_len if chunk_len is None else chunk_len
+        if chunk_len < 1 or T % chunk_len or (self._memory_snapshots and chunk_len != self.chunk_len):
+            raise ValueError("Replay chunks must align with captured memory boundaries")
 
         # Split each env's T-step rollout into (T // chunk_len) chunks
         num_chunks_per_env = T // chunk_len
@@ -372,10 +396,9 @@ class RolloutBuffer:
         # Shuffle chunk ordering for stochasticity
         chunk_indices = torch.randperm(total_chunks, device=self.device)
 
-        chunks_per_batch = total_chunks // num_mini_batches
-
-        for start in range(0, total_chunks, chunks_per_batch):
-            batch_idx = chunk_indices[start : start + chunks_per_batch]
+        if not 1 <= num_mini_batches <= total_chunks:
+            raise ValueError("num_mini_batches must be between 1 and the number of chunks")
+        for batch_idx in torch.tensor_split(chunk_indices, num_mini_batches):
             yield self._collect_chunk_batch(batch_idx, chunk_len, num_chunks_per_env)
 
     def _collect_chunk_batch(
@@ -453,6 +476,13 @@ class RolloutBuffer:
             for layer in range(num_layers)
         ], dim=0)   # (num_layers, num_chunks, D_h)
 
+        memory = (None, None, None)
+        if self._memory_snapshots:
+            memory = tuple(torch.stack([
+                self._memory_snapshots[int(t)][field][int(env)]
+                for t, env in zip(start_steps.tolist(), env_ids.tolist())
+            ]).to(self.device) for field in range(3))
+
         return RecurrentBatch(
             patch_embeds      = patch_batch,
             cls_embeds        = cls_batch,
@@ -468,6 +498,9 @@ class RolloutBuffer:
             can_stop          = _flat(can_stop_list),
             pointgoals        = _flat(pointgoal_list),
             pointgoal_dropped = _flat(pg_dropped_list),
+            memory_buffer     = memory[0],
+            memory_pose_buffer = memory[1],
+            memory_mask       = memory[2],
         )
 
     # ------------------------------------------------------------------
@@ -479,6 +512,7 @@ class RolloutBuffer:
 
     def reset(self) -> None:
         self._step = 0
+        self._memory_snapshots.clear()
 
     @property
     def current_hidden(self) -> torch.Tensor:

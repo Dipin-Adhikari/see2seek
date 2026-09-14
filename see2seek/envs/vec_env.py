@@ -41,6 +41,8 @@ def _worker(
     shared_rgb: torch.Tensor,       # pre-shared (3, H, W) buffer for this worker
     shared_goal: torch.Tensor,      # pre-shared (512,) buffer for this worker
     shared_pointgoal: torch.Tensor, # pre-shared (3,) buffer for this worker
+    episodes=None,
+    goal_embeddings=None,
 ) -> None:
     import os
     os.environ["SEE2SEEK_NO_CLOUD_RENDERING"] = "1"
@@ -51,7 +53,8 @@ def _worker(
 
     parent_conn.close()
 
-    env = RoboTHOREnv(cfg, worker_id=worker_id)
+    env = RoboTHOREnv(cfg, worker_id=worker_id, episodes=episodes,
+                     goal_embeddings=goal_embeddings)
 
     while True:
         try:
@@ -71,7 +74,10 @@ def _worker(
                 action = args[0]
                 obs, reward, done, info = env.step(action)
                 if done:
-                    obs = env.reset()
+                    try:
+                        obs = env.reset()
+                    except StopIteration:
+                        info["exhausted"] = True
                 shared_rgb.copy_(obs["rgb"])
                 shared_goal.copy_(obs["goal"])
                 shared_pointgoal.copy_(obs["pointgoal"])
@@ -112,9 +118,13 @@ _WORKER_DEAD_EXCEPTIONS = (BrokenPipeError, EOFError, ConnectionError, OSError)
 
 
 class VecEnv:
-    def __init__(self, cfg, num_envs: Optional[int] = None) -> None:
+    def __init__(self, cfg, num_envs: Optional[int] = None,
+                 episode_shards=None, goal_embeddings=None) -> None:
         self.cfg = cfg
         self.num_envs = num_envs or cfg.env.num_envs
+        self._episode_shards = episode_shards
+        self._goal_embeddings = goal_embeddings
+        self._inactive = set()
 
         self._parent_conns: List[mp.connection.Connection] = []
         self._processes: List[mp.Process] = []
@@ -158,7 +168,9 @@ class VecEnv:
         parent_conn, child_conn = ctx.Pipe()
         p = ctx.Process(
             target=_worker,
-            args=(worker_id, cfg, child_conn, parent_conn, rgb_buf, goal_buf, pointgoal_buf),
+            args=(worker_id, cfg, child_conn, parent_conn, rgb_buf, goal_buf, pointgoal_buf,
+                  None if self._episode_shards is None else self._episode_shards[worker_id],
+                  self._goal_embeddings),
             daemon=True,
         )
         p.start()
@@ -166,6 +178,8 @@ class VecEnv:
         return parent_conn, p, rgb_buf, goal_buf, pointgoal_buf
 
     def _respawn_worker(self, i: int) -> None:
+        if self._episode_shards is not None:
+            raise RuntimeError(f"Evaluation worker {i} failed; aborting to avoid incomplete metrics")
         logger.warning(f"VecEnv: respawning dead worker {i}")
 
         old_proc = self._processes[i]
@@ -212,7 +226,9 @@ class VecEnv:
             if i in dead:
                 continue
             try:
-                conn.recv()
+                result = conn.recv()
+                if isinstance(result, tuple) and result[0] == "__error__":
+                    dead.add(i)
             except _WORKER_DEAD_EXCEPTIONS:
                 dead.add(i)
 
@@ -227,6 +243,8 @@ class VecEnv:
         dead: set = set()
 
         for i, (conn, action) in enumerate(zip(self._parent_conns, actions.tolist())):
+            if i in self._inactive:
+                continue
             try:
                 conn.send(("step", action))
             except _WORKER_DEAD_EXCEPTIONS:
@@ -234,6 +252,9 @@ class VecEnv:
 
         results: List[Any] = [None] * self.num_envs
         for i, conn in enumerate(self._parent_conns):
+            if i in self._inactive:
+                results[i] = ("ok", 0.0, False, {"exhausted": True})
+                continue
             if i in dead:
                 continue
             try:
@@ -242,6 +263,8 @@ class VecEnv:
                     dead.add(i)
                 else:
                     results[i] = result
+                    if result[3].get("exhausted", False):
+                        self._inactive.add(i)
             except _WORKER_DEAD_EXCEPTIONS:
                 dead.add(i)
 
@@ -262,6 +285,10 @@ class VecEnv:
 
         return self._stack_obs(), rewards, dones, infos
 
+    @property
+    def all_exhausted(self) -> bool:
+        return len(self._inactive) == self.num_envs
+
     def set_max_steps(self, max_steps: int) -> None:
         """Update effective max_steps on all worker environments (curriculum)."""
         self._current_max_steps = max_steps
@@ -276,12 +303,18 @@ class VecEnv:
         for conn in self._parent_conns:
             try:
                 conn.send(("close",))
-            except BrokenPipeError:
+            except _WORKER_DEAD_EXCEPTIONS:
                 pass
         for p in self._processes:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=2)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2)
+        for conn in self._parent_conns:
+            conn.close()
         logger.info("VecEnv: all workers closed")
 
     def _send_recv_all(self, cmd: str, *args: Any) -> None:
@@ -295,7 +328,9 @@ class VecEnv:
             if i in dead:
                 continue
             try:
-                conn.recv()
+                result = conn.recv()
+                if isinstance(result, tuple) and result[0] == "__error__":
+                    dead.add(i)
             except _WORKER_DEAD_EXCEPTIONS:
                 dead.add(i)
         for i in dead:
@@ -311,5 +346,5 @@ class VecEnv:
         }
 
 
-def make_vec_envs(cfg, num_envs: Optional[int] = None) -> VecEnv:
-    return VecEnv(cfg, num_envs=num_envs)
+def make_vec_envs(cfg, num_envs: Optional[int] = None, **kwargs) -> VecEnv:
+    return VecEnv(cfg, num_envs=num_envs, **kwargs)

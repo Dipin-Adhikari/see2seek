@@ -18,6 +18,8 @@ import logging
 import math
 import os
 import time
+from copy import deepcopy
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 import torch
@@ -26,6 +28,7 @@ from see2seek.utils.config import Config
 from see2seek.models.encoders.dino_encoder import DINOv2Encoder
 from see2seek.models.encoders.clip_encoder import CLIPGoalEncoder
 from see2seek.envs.vec_env import make_vec_envs
+from see2seek.envs.robothor_env import RoboTHOREnv
 from see2seek.agents.gru_policy import build_policy
 
 logger = logging.getLogger(__name__)
@@ -50,36 +53,38 @@ class Evaluator:
         checkpoint_path: str,
         device: Optional[str] = None,
         num_envs: Optional[int] = None,
+        obs_encoder_type: Optional[str] = None,
     ) -> None:
-        self.cfg = cfg
+        self.cfg = cfg = deepcopy(cfg)
         self.device = torch.device(device or cfg.device)
         self.num_envs = num_envs or cfg.env.num_envs
+        if self.num_envs < 1:
+            raise ValueError("num_envs must be positive")
 
-        # Auto-detect obs_encoder_type from checkpoint if not explicitly set
+        # Restore the complete architecture; dataset and output settings remain
+        # controlled by the evaluation config.
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         ckpt_cfg = ckpt.get("cfg", None)
         if ckpt_cfg is not None:
-            ckpt_enc_type = getattr(getattr(ckpt_cfg, "encoder", None), "obs_encoder_type", None)
-            if ckpt_enc_type and cfg.encoder.obs_encoder_type == "dino":
-                # Override with checkpoint's encoder type (unless user explicitly set it)
-                cfg.encoder.obs_encoder_type = ckpt_enc_type
-                if ckpt_enc_type != "dino":
-                    logger.info(f"Auto-detected obs_encoder_type='{ckpt_enc_type}' from checkpoint")
+            cfg.encoder = deepcopy(ckpt_cfg.encoder)
+            cfg.policy = deepcopy(ckpt_cfg.policy)
 
         self.obs_encoder_type = cfg.encoder.obs_encoder_type
+        if obs_encoder_type is not None and obs_encoder_type != self.obs_encoder_type:
+            raise ValueError(f"Checkpoint uses {self.obs_encoder_type}, requested {obs_encoder_type}")
 
         # ---- Load encoders ----
         if self.obs_encoder_type == "dino":
-            self.obs_encoder = DINOv2Encoder(device=str(self.device))
+            self.obs_encoder = DINOv2Encoder(device=str(self.device), normalize=cfg.encoder.obs_normalize)
         else:
             self.obs_encoder = None
-        self.goal_encoder = CLIPGoalEncoder(device=str(self.device))
+        self.goal_encoder = CLIPGoalEncoder(device=str(self.device), normalize=cfg.encoder.goal_normalize)
 
         # ---- Load policy ----
         self.policy = build_policy(cfg, str(self.device))
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.policy.eval()
-        logger.info(f"Loaded checkpoint (step {ckpt.get('total_steps', '?'):,})")
+        logger.info(f"Loaded checkpoint (step {ckpt.get('total_steps', '?')})")
 
         logger.info(f"Evaluator ready — obs_encoder={self.obs_encoder_type}, checkpoint: {checkpoint_path}, num_envs: {self.num_envs}")
 
@@ -107,21 +112,42 @@ class Evaluator:
         Returns:
             Dict with "sr", "spl", "num_episodes", "mean_steps", "mean_collisions".
         """
+        if task not in ("imagenav", "objectnav"):
+            raise ValueError(f"Unknown evaluation task: {task}")
+        if num_episodes is not None and num_episodes <= 0:
+            raise ValueError("num_episodes must be positive")
+        self._select_split(split)
+        episodes = RoboTHOREnv._load_episodes(self.cfg.env.episodes_path)
+        ids = [ep["id"] for ep in episodes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("Evaluation episode IDs must be unique")
+        if num_episodes is not None:
+            episodes = episodes[:num_episodes]
+        num_episodes = len(episodes)
+        self.num_envs = min(self.num_envs, num_episodes)
+        shards = [episodes[i::self.num_envs] for i in range(self.num_envs)]
+        text_goals = None
+        if task == "objectnav":
+            categories = sorted({ep["object_type"] for ep in episodes})
+            names = self._get_category_map("en")
+            embeddings = self.goal_encoder.encode_text([names[c] for c in categories]).cpu()
+            text_goals = dict(zip(categories, embeddings))
+
         # Setup log file
         if log_file is None:
-            eval_log_dir = os.path.join(self.cfg.logging.log_dir, "val")
+            eval_log_dir = os.path.join(self.cfg.logging.log_dir, split)
             os.makedirs(eval_log_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             log_file = os.path.join(
                 eval_log_dir, f"eval_{task}_{split}_{timestamp}.log"
             )
 
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         eval_logger = logging.getLogger("see2seek.eval")
         eval_logger.setLevel(logging.INFO)
         eval_logger.addHandler(file_handler)
-        eval_logger.addHandler(logging.StreamHandler())
 
         eval_logger.info(f"=== Evaluation Start ===")
         eval_logger.info(f"  Task: {task} | Split: {split} | Num envs: {self.num_envs}")
@@ -135,238 +161,234 @@ class Evaluator:
         all_path_lengths = []
         all_shortest_path_lengths = []
 
-        # Launch parallel environments
-        vec_env = make_vec_envs(self.cfg, num_envs=self.num_envs)
+        vec_env = None
+        try:
+            # Launch parallel environments
+            vec_env = make_vec_envs(self.cfg, num_envs=self.num_envs,
+                                   episode_shards=shards, goal_embeddings=text_goals)
 
-        # Initial reset
-        obs_dict = vec_env.reset_all()
+            # Initial reset
+            obs_dict = vec_env.reset_all()
 
-        # Policy state
-        hidden = self.policy.get_initial_hidden(self.num_envs, self.device)
-        prev_actions = torch.full(
-            (self.num_envs,), self.cfg.env.num_actions, dtype=torch.long, device=self.device
-        )
-        masks = torch.ones(self.num_envs, 1, device=self.device)
-        steps_since_reset = torch.zeros(self.num_envs, device=self.device)
+            # Policy state
+            hidden = self.policy.get_initial_hidden(self.num_envs, self.device)
+            prev_actions = torch.full(
+                (self.num_envs,), self.cfg.env.num_actions, dtype=torch.long, device=self.device
+            )
+            masks = torch.ones(self.num_envs, 1, device=self.device)
+            steps_since_reset = torch.zeros(self.num_envs, device=self.device)
 
-        # Episodic memory buffers
-        memory_size = getattr(self.cfg.encoder, "memory_size", 64)
-        cls_dim_for_mem = (
-            self.cfg.encoder.dino_cls_dim if self.obs_encoder_type == "dino"
-            else self.cfg.encoder.goal_embed_dim
-        )
-        memory_buffer = torch.zeros(
-            self.num_envs, memory_size, cls_dim_for_mem, device=self.device
-        )
-        memory_pose_buffer = torch.zeros(
-            self.num_envs, memory_size, 4, device=self.device
-        )
-        memory_mask = torch.zeros(
-            self.num_envs, memory_size, device=self.device, dtype=torch.bool
-        )
-        # Dead-reckoned pose for evaluation
-        agent_poses = torch.zeros(self.num_envs, 4, device=self.device)
-        agent_poses[:, 2] = 1.0
+            memory_buffer, memory_pose_buffer, memory_mask = self.policy.get_initial_memory(
+                self.num_envs, self.device
+            )
+            # Dead-reckoned pose for evaluation
+            agent_poses = torch.zeros(self.num_envs, 4, device=self.device)
+            agent_poses[:, 2] = 1.0
 
-        episode_count = 0
-        total_steps = 0
-        start_time = time.time()
+            episode_count = 0
+            total_steps = 0
+            start_time = time.time()
 
-        while True:
-            if num_episodes is not None and episode_count >= num_episodes:
-                break
+            while True:
+                if num_episodes is not None and episode_count >= num_episodes:
+                    break
 
-            with torch.no_grad():
-                rgb = obs_dict["rgb"].to(self.device)
-                if self.obs_encoder_type == "dino":
-                    cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
-                else:
-                    cls_embed = self.goal_encoder.get_obs_embedding(rgb)
-                    patch_embed = None
+                with torch.no_grad():
+                    rgb = obs_dict["rgb"].to(self.device)
+                    if self.obs_encoder_type == "dino":
+                        cls_embed, patch_embed = self.obs_encoder.get_all_embeddings(rgb)
+                    else:
+                        cls_embed = self.goal_encoder.get_obs_embedding(rgb)
+                        patch_embed = None
 
-                goal_embed = obs_dict["goal"].to(self.device)
-                if task == "objectnav" or zero_pointgoal:
-                    pointgoal = torch.zeros(self.num_envs, 3, device=self.device)
-                else:
-                    pointgoal = obs_dict["pointgoal"].to(self.device)
+                    goal_embed = obs_dict["goal"].to(self.device)
+                    if task == "objectnav" or zero_pointgoal:
+                        pointgoal = torch.zeros(self.num_envs, 3, device=self.device)
+                    else:
+                        pointgoal = obs_dict["pointgoal"].to(self.device)
 
-                can_stop = steps_since_reset >= self.cfg.env.min_steps_before_stop
+                    can_stop = steps_since_reset >= self.cfg.env.min_steps_before_stop
 
-                dist, _, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
-                    patch_embed, cls_embed, goal_embed, prev_actions,
-                    hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
-                    memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
-                    memory_mask=memory_mask, poses=agent_poses,
-                )
-                actions = dist.sample()
-
-            obs_dict, rewards, dones, infos = vec_env.step(actions)
-
-            # Dead-reckon pose update
-            cos_r = math.cos(math.radians(self.cfg.env.rotate_degrees))
-            sin_r = math.sin(math.radians(self.cfg.env.rotate_degrees))
-            dones_dev = dones.to(self.device)
-
-            agent_poses[dones_dev] = 0.0
-            agent_poses[dones_dev, 2] = 1.0
-
-            is_move = (actions == 0) & ~dones_dev
-            if is_move.any():
-                agent_poses[is_move, 0] += self.cfg.env.move_magnitude * agent_poses[is_move, 3]
-                agent_poses[is_move, 1] += self.cfg.env.move_magnitude * agent_poses[is_move, 2]
-            is_left = (actions == 1) & ~dones_dev
-            if is_left.any():
-                c = agent_poses[is_left, 2].clone()
-                s = agent_poses[is_left, 3].clone()
-                agent_poses[is_left, 2] = c * cos_r - s * sin_r
-                agent_poses[is_left, 3] = s * cos_r + c * sin_r
-            is_right = (actions == 2) & ~dones_dev
-            if is_right.any():
-                c = agent_poses[is_right, 2].clone()
-                s = agent_poses[is_right, 3].clone()
-                agent_poses[is_right, 2] = c * cos_r + s * sin_r
-                agent_poses[is_right, 3] = s * cos_r - c * sin_r
-
-            steps_since_reset += 1
-            total_steps += self.num_envs
-
-            # Process completed episodes
-            for env_idx in range(self.num_envs):
-                if dones[env_idx]:
-                    info = infos[env_idx]
-                    success = info.get("success", False)
-                    spl = info.get("spl", 0.0)
-                    ep_steps = info.get("num_steps", 0)
-                    ep_id = info.get("episode_id", "?")
-                    scene_id = info.get("scene_id", "?")
-                    collisions = info.get("collisions", 0)
-                    path_len = info.get("path_length", 0.0)
-                    sp_len = info.get("shortest_path_length", 0.0)
-
-                    successes.append(int(success))
-                    spls.append(spl)
-                    all_steps.append(ep_steps)
-                    all_collisions.append(collisions)
-                    all_path_lengths.append(path_len)
-                    all_shortest_path_lengths.append(sp_len)
-                    episode_count += 1
-
-                    eval_logger.info(
-                        f"[ep {episode_count:4d}] scene={scene_id} id={ep_id} "
-                        f"success={success} steps={ep_steps} collisions={collisions} "
-                        f"spl={spl:.3f} path={path_len:.2f} shortest={sp_len:.2f}"
+                    dist, _, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
+                        patch_embed, cls_embed, goal_embed, prev_actions,
+                        hidden, masks, pointgoal=pointgoal, can_stop=can_stop,
+                        memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
+                        memory_mask=memory_mask, poses=agent_poses,
                     )
+                    actions = dist.sample()
 
-                    if episode_count % 50 == 0:
-                        elapsed = time.time() - start_time
-                        sr_so_far = sum(successes) / len(successes)
-                        spl_so_far = sum(spls) / len(spls)
+                obs_dict, rewards, dones, infos = vec_env.step(actions)
+
+                # Dead-reckon pose update
+                cos_r = math.cos(math.radians(self.cfg.env.rotate_degrees))
+                sin_r = math.sin(math.radians(self.cfg.env.rotate_degrees))
+                dones_dev = dones.to(self.device)
+
+                agent_poses[dones_dev] = 0.0
+                agent_poses[dones_dev, 2] = 1.0
+
+                move_success = torch.tensor(
+                    [info.get("move_success", True) for info in infos],
+                    dtype=torch.bool, device=self.device,
+                )
+                is_move = (actions == 0) & ~dones_dev & move_success
+                if is_move.any():
+                    agent_poses[is_move, 0] += self.cfg.env.move_magnitude * agent_poses[is_move, 3]
+                    agent_poses[is_move, 1] += self.cfg.env.move_magnitude * agent_poses[is_move, 2]
+                is_left = (actions == 1) & ~dones_dev
+                if is_left.any():
+                    c = agent_poses[is_left, 2].clone()
+                    s = agent_poses[is_left, 3].clone()
+                    agent_poses[is_left, 2] = c * cos_r - s * sin_r
+                    agent_poses[is_left, 3] = s * cos_r + c * sin_r
+                is_right = (actions == 2) & ~dones_dev
+                if is_right.any():
+                    c = agent_poses[is_right, 2].clone()
+                    s = agent_poses[is_right, 3].clone()
+                    agent_poses[is_right, 2] = c * cos_r + s * sin_r
+                    agent_poses[is_right, 3] = s * cos_r - c * sin_r
+
+                steps_since_reset += 1
+                total_steps += self.num_envs
+
+                # Process completed episodes
+                for env_idx in range(self.num_envs):
+                    if dones[env_idx]:
+                        info = infos[env_idx]
+                        if info.get("controller_crashed", False):
+                            raise RuntimeError("Simulator crashed during evaluation; results are incomplete")
+                        success = info.get("success", False)
+                        spl = info.get("spl", 0.0)
+                        ep_steps = info.get("num_steps", 0)
+                        ep_id = info.get("episode_id", "?")
+                        scene_id = info.get("scene_id", "?")
+                        collisions = info.get("collisions", 0)
+                        path_len = info.get("path_length", 0.0)
+                        sp_len = info.get("shortest_path_length", 0.0)
+
+                        successes.append(int(success))
+                        spls.append(spl)
+                        all_steps.append(ep_steps)
+                        all_collisions.append(collisions)
+                        all_path_lengths.append(path_len)
+                        all_shortest_path_lengths.append(sp_len)
+                        episode_count += 1
+
                         eval_logger.info(
-                            f"  --- Progress: {episode_count} episodes | "
-                            f"SR={sr_so_far:.3f} SPL={spl_so_far:.3f} | "
-                            f"time={elapsed:.0f}s ---"
+                            f"[ep {episode_count:4d}] scene={scene_id} id={ep_id} "
+                            f"success={success} steps={ep_steps} collisions={collisions} "
+                            f"spl={spl:.3f} path={path_len:.2f} shortest={sp_len:.2f}"
                         )
 
-                    if num_episodes is not None and episode_count >= num_episodes:
-                        break
+                        if episode_count % 50 == 0:
+                            elapsed = time.time() - start_time
+                            sr_so_far = sum(successes) / len(successes)
+                            spl_so_far = sum(spls) / len(spls)
+                            eval_logger.info(
+                                f"  --- Progress: {episode_count} episodes | "
+                                f"SR={sr_so_far:.3f} SPL={spl_so_far:.3f} | "
+                                f"time={elapsed:.0f}s ---"
+                            )
 
-            # Update recurrent state
-            new_masks = (~dones).float().unsqueeze(1).to(self.device)
-            hidden = hidden_next * new_masks.unsqueeze(0)
-            # Reset steps counter for done envs
-            steps_since_reset = torch.where(
-                dones.to(self.device), torch.zeros_like(steps_since_reset), steps_since_reset
-            )
-            prev_actions = actions
-            masks = new_masks
+                        if num_episodes is not None and episode_count >= num_episodes:
+                            break
 
-        vec_env.close()
-
-        # Final results
-        elapsed = time.time() - start_time
-        n = max(len(successes), 1)
-        sr = sum(successes) / n
-        spl_mean = sum(spls) / n
-        mean_steps = sum(all_steps) / n
-        mean_collisions = sum(all_collisions) / n
-        mean_path = sum(all_path_lengths) / n
-        mean_sp = sum(all_shortest_path_lengths) / n
-
-        result = {
-            "sr": round(sr, 4),
-            "spl": round(spl_mean, 4),
-            "num_episodes": episode_count,
-            "mean_steps": round(mean_steps, 1),
-            "mean_collisions": round(mean_collisions, 1),
-            "mean_path_length": round(mean_path, 2),
-            "mean_shortest_path": round(mean_sp, 2),
-            "total_time_s": round(elapsed, 1),
-            "eps_per_sec": round(episode_count / max(elapsed, 1), 2),
-        }
-
-        eval_logger.info(f"\n=== Evaluation Complete ===")
-        eval_logger.info(f"  Episodes:       {episode_count}")
-        eval_logger.info(f"  SR:             {sr:.4f}")
-        eval_logger.info(f"  SPL:            {spl_mean:.4f}")
-        eval_logger.info(f"  Mean steps:     {mean_steps:.1f}")
-        eval_logger.info(f"  Mean collisions:{mean_collisions:.1f}")
-        eval_logger.info(f"  Mean path:      {mean_path:.2f}m (travelled)")
-        eval_logger.info(f"  Mean shortest:  {mean_sp:.2f}m (oracle)")
-        eval_logger.info(f"  Time:           {elapsed:.1f}s ({result['eps_per_sec']:.2f} eps/s)")
-        eval_logger.info(f"  Log saved:      {log_file}")
-
-        # Breakdown by difficulty (shortest path length buckets)
-        easy, medium, hard = [], [], []
-        easy_sr, medium_sr, hard_sr = [], [], []
-        for i, sp in enumerate(all_shortest_path_lengths):
-            if sp < 3.0:
-                easy.append(i)
-                easy_sr.append(successes[i])
-            elif sp < 7.0:
-                medium.append(i)
-                medium_sr.append(successes[i])
-            else:
-                hard.append(i)
-                hard_sr.append(successes[i])
-
-        eval_logger.info(f"\n=== Difficulty Breakdown (by shortest path length) ===")
-        for label, indices, sr_list in [
-            ("Easy (<3m)", easy, easy_sr),
-            ("Medium (3-7m)", medium, medium_sr),
-            ("Hard (>7m)", hard, hard_sr),
-        ]:
-            if indices:
-                bucket_sr = sum(sr_list) / len(sr_list)
-                bucket_spl = sum(spls[j] for j in indices) / len(indices)
-                bucket_path = sum(all_path_lengths[j] for j in indices) / len(indices)
-                bucket_sp = sum(all_shortest_path_lengths[j] for j in indices) / len(indices)
-                eval_logger.info(
-                    f"  {label:16s}: n={len(indices):4d} SR={bucket_sr:.3f} "
-                    f"SPL={bucket_spl:.3f} path={bucket_path:.1f}m shortest={bucket_sp:.1f}m"
+                # Update recurrent state
+                new_masks = (~dones).float().unsqueeze(1).to(self.device)
+                hidden = hidden_next * new_masks.unsqueeze(0)
+                # Reset steps counter for done envs
+                steps_since_reset = torch.where(
+                    dones.to(self.device), torch.zeros_like(steps_since_reset), steps_since_reset
                 )
-            else:
-                eval_logger.info(f"  {label:16s}: n=   0")
+                prev_actions = actions
+                masks = new_masks
+                if vec_env.all_exhausted and episode_count < num_episodes:
+                    raise RuntimeError("Evaluation ended before all requested episodes completed")
 
-        result["easy_sr"] = round(sum(easy_sr) / max(len(easy_sr), 1), 4)
-        result["medium_sr"] = round(sum(medium_sr) / max(len(medium_sr), 1), 4)
-        result["hard_sr"] = round(sum(hard_sr) / max(len(hard_sr), 1), 4)
-        result["easy_n"] = len(easy)
-        result["medium_n"] = len(medium)
-        result["hard_n"] = len(hard)
 
-        # Cleanup logger
-        eval_logger.removeHandler(file_handler)
-        file_handler.close()
+            # Final results
+            elapsed = time.time() - start_time
+            n = max(len(successes), 1)
+            sr = sum(successes) / n
+            spl_mean = sum(spls) / n
+            mean_steps = sum(all_steps) / n
+            mean_collisions = sum(all_collisions) / n
+            mean_path = sum(all_path_lengths) / n
+            mean_sp = sum(all_shortest_path_lengths) / n
 
-        return result
+            result = {
+                "sr": round(sr, 4),
+                "spl": round(spl_mean, 4),
+                "num_episodes": episode_count,
+                "mean_steps": round(mean_steps, 1),
+                "mean_collisions": round(mean_collisions, 1),
+                "mean_path_length": round(mean_path, 2),
+                "mean_shortest_path": round(mean_sp, 2),
+                "total_time_s": round(elapsed, 1),
+                "eps_per_sec": round(episode_count / max(elapsed, 1), 2),
+            }
+
+            eval_logger.info(f"\n=== Evaluation Complete ===")
+            eval_logger.info(f"  Episodes:       {episode_count}")
+            eval_logger.info(f"  SR:             {sr:.4f}")
+            eval_logger.info(f"  SPL:            {spl_mean:.4f}")
+            eval_logger.info(f"  Mean steps:     {mean_steps:.1f}")
+            eval_logger.info(f"  Mean collisions:{mean_collisions:.1f}")
+            eval_logger.info(f"  Mean path:      {mean_path:.2f}m (travelled)")
+            eval_logger.info(f"  Mean shortest:  {mean_sp:.2f}m (oracle)")
+            eval_logger.info(f"  Time:           {elapsed:.1f}s ({result['eps_per_sec']:.2f} eps/s)")
+            eval_logger.info(f"  Log saved:      {log_file}")
+
+            # Breakdown by difficulty (shortest path length buckets)
+            easy, medium, hard = [], [], []
+            easy_sr, medium_sr, hard_sr = [], [], []
+            for i, sp in enumerate(all_shortest_path_lengths):
+                if sp <= 3.0:
+                    easy.append(i)
+                    easy_sr.append(successes[i])
+                elif sp <= 6.0:
+                    medium.append(i)
+                    medium_sr.append(successes[i])
+                else:
+                    hard.append(i)
+                    hard_sr.append(successes[i])
+
+            eval_logger.info(f"\n=== Difficulty Breakdown (by shortest path length) ===")
+            for label, indices, sr_list in [
+                ("Easy (<=3m)", easy, easy_sr),
+                ("Medium (3-6m)", medium, medium_sr),
+                ("Hard (>6m)", hard, hard_sr),
+            ]:
+                if indices:
+                    bucket_sr = sum(sr_list) / len(sr_list)
+                    bucket_spl = sum(spls[j] for j in indices) / len(indices)
+                    bucket_path = sum(all_path_lengths[j] for j in indices) / len(indices)
+                    bucket_sp = sum(all_shortest_path_lengths[j] for j in indices) / len(indices)
+                    eval_logger.info(
+                        f"  {label:16s}: n={len(indices):4d} SR={bucket_sr:.3f} "
+                        f"SPL={bucket_spl:.3f} path={bucket_path:.1f}m shortest={bucket_sp:.1f}m"
+                    )
+                else:
+                    eval_logger.info(f"  {label:16s}: n=   0")
+
+            result["easy_sr"] = round(sum(easy_sr) / max(len(easy_sr), 1), 4)
+            result["medium_sr"] = round(sum(medium_sr) / max(len(medium_sr), 1), 4)
+            result["hard_sr"] = round(sum(hard_sr) / max(len(hard_sr), 1), 4)
+            result["easy_n"] = len(easy)
+            result["medium_n"] = len(medium)
+            result["hard_n"] = len(hard)
+
+            return result
+
+        finally:
+            if vec_env is not None:
+                vec_env.close()
+            eval_logger.removeHandler(file_handler)
+            file_handler.close()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _load_checkpoint(self, path: str) -> None:
-        """Legacy method — checkpoint loading is now done in __init__."""
-        pass
 
     @staticmethod
     def _get_category_map(language: str) -> Dict[str, str]:
@@ -403,3 +425,22 @@ class Evaluator:
                 "Television":   "television",
                 "Vase":         "vase",
             }
+
+    def _select_split(self, split: str) -> None:
+        """Resolve sibling split directories, preserving custom split roots."""
+        if split not in ("val", "test"):
+            raise ValueError("Evaluation split must be val or test")
+        env = self.cfg.env
+        if env.split != split:
+            for name in ("scene_dataset_path", "episodes_path"):
+                path = Path(getattr(env, name))
+                parts = list(path.parts)
+                indices = [i for i, part in enumerate(parts) if part in ("train", "val", "test")]
+                if not indices:
+                    raise ValueError(f"Set env.split={split} and explicit {name} for custom dataset paths")
+                parts[indices[-1]] = split
+                setattr(env, name, str(Path(*parts)))
+        env.split = split
+        for name in ("scene_dataset_path", "episodes_path"):
+            if not Path(getattr(env, name)).exists():
+                raise FileNotFoundError(f"{name} does not exist: {getattr(env, name)}")

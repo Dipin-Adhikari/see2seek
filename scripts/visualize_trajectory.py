@@ -42,6 +42,7 @@ import logging
 import math
 import os
 import sys
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -51,7 +52,7 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from see2seek.utils.config import Config, load_config
-from see2seek.agents.gru_policy import build_policy, EpisodicMemory
+from see2seek.agents.gru_policy import build_policy
 from see2seek.models.encoders.dino_encoder import DINOv2Encoder
 from see2seek.models.encoders.clip_encoder import CLIPGoalEncoder
 
@@ -318,17 +319,7 @@ def run_episode(
     with_pointgoal = getattr(cfg.encoder, "with_pointgoal", False)
 
     hidden = policy.get_initial_hidden(1, device)
-    cls_dim = (
-        cfg.encoder.dino_cls_dim if obs_encoder_type == "dino"
-        else cfg.encoder.goal_embed_dim
-    )
-    memory_buffer = torch.zeros(
-        1, policy.memory_size, cls_dim, device=device
-    )
-    memory_pose_buffer = torch.zeros(
-        1, policy.memory_size, EpisodicMemory.POSE_DIM, device=device
-    )
-    memory_mask = torch.zeros(1, policy.memory_size, device=device, dtype=torch.bool)
+    memory_buffer, memory_pose_buffer, memory_mask = policy.get_initial_memory(1, device)
     prev_action = torch.tensor([cfg.env.num_actions], device=device)
     masks = torch.ones(1, 1, device=device)
 
@@ -604,6 +595,11 @@ def main():
         cfg = load_config(args.config)
     else:
         cfg = Config()
+
+    # Dataset/log overrides must not change the checkpoint's ablation architecture.
+    if checkpoint.get("cfg") is not None:
+        cfg.encoder = deepcopy(checkpoint["cfg"].encoder)
+        cfg.policy = deepcopy(checkpoint["cfg"].policy)
 
     cfg.device = args.device
 

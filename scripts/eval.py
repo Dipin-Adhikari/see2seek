@@ -33,6 +33,8 @@ def parse_args():
     p.add_argument("--zero_pointgoal", action="store_true", help="Zero out PointGoal (test visual-only navigation)")
     p.add_argument("--log_file",   default=None, help="Path to save eval log (auto-generated if None)")
     p.add_argument("--device",     default=None)
+    p.add_argument("--episodes_path", default=None, help="Explicit evaluation episode path")
+    p.add_argument("--scene_dataset_path", default=None, help="Explicit evaluation split directory")
     return p.parse_args()
 
 
@@ -53,12 +55,19 @@ def main():
         cfg.encoder.obs_encoder_type = args.obs_encoder
     if args.min_steps_before_stop is not None:
         cfg.env.min_steps_before_stop = args.min_steps_before_stop
+    if args.episodes_path or args.scene_dataset_path:
+        if not (args.episodes_path and args.scene_dataset_path):
+            raise SystemExit("Provide both --episodes_path and --scene_dataset_path")
+        cfg.env.episodes_path = args.episodes_path
+        cfg.env.scene_dataset_path = args.scene_dataset_path
+        cfg.env.split = args.split
 
     from see2seek.evaluation.evaluator import Evaluator
     evaluator = Evaluator(
         cfg,
         checkpoint_path=args.checkpoint,
         num_envs=args.num_envs,
+        obs_encoder_type=args.obs_encoder,
     )
     results = evaluator.evaluate(
         split=args.split,

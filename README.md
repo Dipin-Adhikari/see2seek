@@ -18,7 +18,7 @@ Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders wi
 
 **Recurrent core:** 2-layer GRU (512 hidden). Layer 1 fuses multimodal perception, layer 2 handles temporal reasoning and planning.
 
-**Episodic memory:** 128-slot circular buffer of past CLS tokens with pose-conditioned cross-attention. Resets at episode boundaries. Stored tokens are detached (no BPTT through time). Gives the agent a "have I been here before?" signal without explicit map construction.
+**Episodic memory:** 128-slot rolling buffer of past CLS tokens with pose-conditioned cross-attention. Resets at episode boundaries. Stored tokens are detached (no BPTT through time). Gives the agent a "have I been here before?" signal without explicit map construction.
 
 **Ego-pose:** Dead-reckoned from discrete actions, only updated on successful moves (collision-aware). Combined with episodic memory, enables loop detection and room escape.
 
@@ -69,7 +69,7 @@ Trained for 10M steps. Difficulty defined by oracle shortest path: easy (<=3m), 
 | `timeout_penalty` | -2.0 | Episode times out without stopping |
 | `geodesic_reward_scale` | 1.5 | Reward for reducing shortest-path distance |
 | `slack_reward` | -0.005 | Per-step cost |
-| `exploration_bonus` | 0.10 | Intrinsic reward for new grid cell visits, decays to 0 over 10M steps |
+| `exploration_bonus` | 0.10 | Intrinsic reward for new grid cell visits, decays to a 0.015 floor over 10M steps |
 | `collision_penalty` | -0.01 | Walking into walls |
 | `rotation_penalty` | -0.002 | Per-rotation cost to prevent spinning |
 
@@ -88,6 +88,40 @@ python scripts/train.py --resume data_dino_v7/checkpoints/checkpoint_00001000000
 python scripts/train.py --debug
 ```
 
+### Ego-pose and episodic-memory ablations
+
+```bash
+# Drop only the direct ego-pose input; memory still uses pose.
+python scripts/train.py --no-egopose
+
+# Drop episodic attention and its GRU input; retain direct ego-pose.
+python scripts/train.py --no-episodic-memory
+
+# Drop both branches.
+python scripts/train.py --no-egopose --no-episodic-memory
+```
+
+Each command still prompts for the output folder. Choose a separate folder for
+each ablation. The equivalent YAML settings are `encoder.use_egopose: false`
+and `encoder.use_episodic_memory: false`.
+
+| DINOv2 variant (PointGoal off) | GRU input dimension |
+|---|---:|
+| Full model | 2336 |
+| No direct ego-pose | 2304 |
+| No episodic memory | 2208 |
+| Neither branch | 2176 |
+
+Disabled branches are removed from the model and GRU input. The no-memory
+variant has no attention parameters, memory buffers, or replay memory snapshots;
+the GRU remains recurrent. `--no-egopose` removes the direct 32-dimensional branch
+only, leaving pose conditioning inside memory when memory is enabled.
+
+These variants change parameter shapes, so start a fresh run for each ablation.
+To resume an ablation, repeat its flags (or use the same YAML settings).
+Evaluation and trajectory visualization restore the architecture from the saved
+checkpoint automatically; no ablation flags are needed for those commands.
+
 ### Configuration
 
 - 16 parallel RoboTHOR workers (shared-memory VecEnv with auto worker respawn)
@@ -95,7 +129,7 @@ python scripts/train.py --debug
 - PPO: 4 epochs, 2 mini-batches, clip=0.2, entropy_coef=0.05
 - Adam lr=2.5e-4 with linear decay
 - Curriculum: max_steps 150 -> 500 over 3M steps
-- Exploration bonus: 0.10 per new cell, decays over 10M steps
+- Exploration bonus: 0.10 per new cell, decays to a 0.015 floor over 10M steps
 
 ## Evaluation
 

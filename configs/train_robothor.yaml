@@ -1,0 +1,8 @@
+# Run from the repository root. Change these paths for another dataset location.
+env:
+  split: train
+  scene_dataset_path: dataset/train
+  episodes_path: dataset/train/episodes
+logging:
+  checkpoint_dir: data_dino_v7/checkpoints
+  log_dir: data_dino_v7/logs

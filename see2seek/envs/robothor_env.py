@@ -129,10 +129,15 @@ class RoboTHOREnv:
         episode_ids: Optional[List[str]] = None,
         worker_id: int = 0,
         render: bool = False,
+        episodes: Optional[List[Dict]] = None,
+        goal_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         self.cfg = cfg
         self._worker_id = worker_id
         self._render = render
+        self._evaluation = episodes is not None
+        self._text_goals = goal_embeddings
+        self._rng = random.Random(cfg.seed + worker_id)
 
         # Observation space transform (only applied to the agent's live camera feed)
         self._transform = transforms.Compose([
@@ -147,7 +152,9 @@ class RoboTHOREnv:
         # scene_dataset_path IS the split folder (e.g. .../imagenav_dataset/debug)
         embeddings_path = os.path.join(cfg.env.scene_dataset_path, "embeddings.pt")
 
-        if os.path.exists(embeddings_path):
+        if goal_embeddings is not None:
+            self._embeddings_registry = goal_embeddings
+        elif os.path.exists(embeddings_path):
             logger.info(f"📂 Loading cached CLIP embeddings registry from: {embeddings_path}")
             self._embeddings_registry = torch.load(embeddings_path, map_location="cpu")
         else:
@@ -157,12 +164,13 @@ class RoboTHOREnv:
         #      - a single .json / .json.gz file, OR
         #      - a directory containing one or more per-scene files
         #    (see _load_episodes for directory-handling / de-dup logic)
-        self._episodes: List[Dict] = self._load_episodes(
+        self._episodes: List[Dict] = episodes if episodes is not None else self._load_episodes(
             cfg.env.episodes_path, episode_ids
         )
 
         self._episode_index: int = 0
-        random.shuffle(self._episodes)
+        if not self._evaluation:
+            self._rng.shuffle(self._episodes)
 
         # Current episode state variables
         self._current_episode: Optional[Dict] = None
@@ -284,8 +292,8 @@ class RoboTHOREnv:
         self._init_controller()
         logger.info(f"RoboTHOREnv[{self._worker_id}] controller restarted successfully.")
 
+    @staticmethod
     def _load_episodes(
-        self,
         path: str,
         episode_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
@@ -379,7 +387,9 @@ class RoboTHOREnv:
         attempt = 0
         while attempt < self._max_reset_retries:
             if self._episode_index >= len(self._episodes):
-                random.shuffle(self._episodes)
+                if self._evaluation:
+                    raise StopIteration("Evaluation episode shard exhausted")
+                self._rng.shuffle(self._episodes)
                 self._episode_index = 0
 
             self._current_episode = self._episodes[self._episode_index]
@@ -406,6 +416,8 @@ class RoboTHOREnv:
 
                 if event.frame is None:
                     last_error = f"Renderer failed to produce a frame after {retries} retries (scene={scene})"
+                    if self._evaluation:
+                        raise RuntimeError(last_error)
                     logger.warning(f"{last_error} — skipping to next episode")
                     attempt += 1
                     continue
@@ -442,12 +454,16 @@ class RoboTHOREnv:
                     f"position={ep['initial_position']}, rotation={start_rotation}: "
                     f"{event.metadata.get('errorMessage')}"
                 )
+                if self._evaluation:
+                    raise RuntimeError(last_error)
                 logger.warning(f"{last_error} — skipping to next episode")
                 attempt += 1
                 continue
 
             if event.frame is None:
                 last_error = f"TeleportFull succeeded but returned no frame (scene={scene})"
+                if self._evaluation:
+                    raise RuntimeError(last_error)
                 logger.warning(f"{last_error} — skipping to next episode")
                 attempt += 1
                 continue
@@ -810,6 +826,9 @@ class RoboTHOREnv:
         (e.g. "debug") — the default in config.py is "train", so make sure
         it's overridden for debug runs or this will raise KeyError below.
         """
+        if self._text_goals is not None:
+            self._cached_goal_embedding = self._text_goals[ep["object_type"]]
+            return self._cached_goal_embedding
         filename = os.path.basename(ep.get("goal_image_path", ""))
         lookup_key = f"{self._split}/images/{filename}"
 

@@ -1,0 +1,7 @@
+# Evaluation visits each episode once. Change these paths for a custom split.
+env:
+  split: val
+  scene_dataset_path: dataset/val
+  episodes_path: dataset/val/episodes
+logging:
+  log_dir: data_dino_v7/logs

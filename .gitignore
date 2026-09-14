@@ -20,3 +20,5 @@ birds_eye_views_with_paths
 logs
 augment_dataset
 .claude
+data_dino_v*/
+.github

@@ -62,6 +62,18 @@ class PPOTrainer:
         self.device = torch.device(cfg.device)
         self.obs_encoder_type = getattr(cfg.encoder, "obs_encoder_type", "dino")
 
+        resume_state = None
+        if resume is not None:
+            resume_state = torch.load(resume, map_location="cpu", weights_only=False)
+            saved_cfg = resume_state.get("cfg")
+            if saved_cfg is not None:
+                for flag in ("use_egopose", "use_episodic_memory"):
+                    if getattr(saved_cfg.encoder, flag, True) != getattr(cfg.encoder, flag, True):
+                        raise ValueError(
+                            f"Cannot resume with a different {flag} setting: the GRU input size changes. "
+                            "Start a new ablation run, or use the checkpoint's original flags."
+                        )
+
         # ---- Logging ----
         self._setup_logging()
 
@@ -145,7 +157,7 @@ class PPOTrainer:
 
         # Resume from checkpoint if provided
         if resume is not None:
-            self._load_checkpoint(resume)
+            self._load_checkpoint(resume, checkpoint=resume_state)
 
         logger.info("PPOTrainer initialised and ready.")
 
@@ -186,6 +198,14 @@ class PPOTrainer:
 
     def train(self) -> None:
         """Run the full PPO training loop until total_num_steps is reached."""
+        try:
+            self._train()
+        finally:
+            self.vec_env.close()
+            if self._wandb is not None:
+                self._wandb.finish()
+
+    def _train(self) -> None:
         cfg = self.cfg
         self._setup_checkpoint_dir()
 
@@ -207,20 +227,9 @@ class PPOTrainer:
             (cfg.env.num_envs,), cfg.env.num_actions, dtype=torch.long, device=self.device
         )   # num_actions index = "no previous action" padding
 
-        # Episodic memory buffers (per-env, persisted across rollouts)
-        memory_size = getattr(cfg.encoder, "memory_size", 64)
-        cls_dim_for_mem = (
-            cfg.encoder.dino_cls_dim if self.obs_encoder_type == "dino"
-            else cfg.encoder.goal_embed_dim
-        )
-        memory_buffer = torch.zeros(
-            cfg.env.num_envs, memory_size, cls_dim_for_mem, device=self.device
-        )
-        memory_pose_buffer = torch.zeros(
-            cfg.env.num_envs, memory_size, 4, device=self.device
-        )
-        memory_mask = torch.zeros(
-            cfg.env.num_envs, memory_size, device=self.device, dtype=torch.bool
+        # Episodic memory is absent in memory-ablation runs.
+        memory_buffer, memory_pose_buffer, memory_mask = self.policy.get_initial_memory(
+            cfg.env.num_envs, self.device
         )
 
         # Dead-reckoned pose: [x, y, cos_theta, sin_theta] per env
@@ -275,7 +284,8 @@ class PPOTrainer:
 
                     # 1b. Encode goal (CLIP — frozen; cached)
                     goal_embed = self._get_goal_embeddings(obs_dict)  # (N, 512)
-                    torch.cuda.synchronize()
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
                     _t_encode += time.time() - _t0
 
                     can_stop = steps_since_reset >= cfg.env.min_steps_before_stop
@@ -290,6 +300,12 @@ class PPOTrainer:
                         pg_dropped = None
 
                     # 1d. Policy forward (with position-augmented episodic memory)
+                    # Use the same feature precision during collection and replay.
+                    cls_embed = cls_embed.to(self.buffer.store_dtype).float()
+                    goal_embed = goal_embed.to(self.buffer.store_dtype).float()
+                    if patch_embed is not None:
+                        patch_embed = patch_embed.to(self.buffer.store_dtype).float()
+                    self.buffer.capture_memory(memory_buffer, memory_pose_buffer, memory_mask)
                     _t0 = time.time()
                     dist, value, hidden_next, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
                         patch_embed, cls_embed, goal_embed, prev_actions,
@@ -299,7 +315,8 @@ class PPOTrainer:
                     )
                     actions   = dist.sample()                      # (N,)
                     log_probs = dist.log_prob(actions)             # (N,)
-                    torch.cuda.synchronize()
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
                     _t_policy += time.time() - _t0
 
                 # Bug 2 fix: snapshot pre-step pose (what the policy actually saw)
@@ -435,11 +452,14 @@ class PPOTrainer:
                     patch_embed = None
                 goal_embed = self._get_goal_embeddings(obs_dict)
                 pointgoal = obs_dict["pointgoal"].to(self.device) if self._with_pointgoal else None
-                _, last_value, _, memory_buffer, memory_pose_buffer, memory_mask = self.policy.act(
+                if pointgoal is not None:
+                    pointgoal = pointgoal * pg_episode_mask
+                _, last_value, _, _, _, _ = self.policy.act(
                     patch_embed, cls_embed, goal_embed, prev_actions, hidden, masks,
                     pointgoal=pointgoal,
-                    memory_buffer=memory_buffer, memory_pose_buffer=memory_pose_buffer,
-                    memory_mask=memory_mask, poses=agent_poses,
+                    memory_buffer=None if memory_buffer is None else memory_buffer.clone(),
+                    memory_pose_buffer=None if memory_pose_buffer is None else memory_pose_buffer.clone(),
+                    memory_mask=None if memory_mask is None else memory_mask.clone(), poses=agent_poses,
                 )
 
                 if self._num_updates % cfg.ppo.log_interval == 0:
@@ -485,7 +505,6 @@ class PPOTrainer:
 
         # Final checkpoint
         self._save_checkpoint(final=True)
-        self.vec_env.close()
         logger.info("=== Training complete ===")
 
     # ------------------------------------------------------------------
@@ -522,6 +541,9 @@ class PPOTrainer:
                     pointgoal    = batch.pointgoals,
                     can_stop     = batch.can_stop,
                     poses        = batch.poses,
+                    memory_buffer = batch.memory_buffer,
+                    memory_pose_buffer = batch.memory_pose_buffer,
+                    memory_mask = batch.memory_mask,
                 )
 
                 # PPO clipped policy loss
@@ -642,10 +664,12 @@ class PPOTrainer:
         }, path)
         logger.info(f"Checkpoint saved: {path}")
 
-    def _load_checkpoint(self, path: str) -> None:
+    def _load_checkpoint(self, path: str, checkpoint=None) -> None:
         """Load a previously saved checkpoint."""
         logger.info(f"Resuming from checkpoint: {path}")
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        ckpt = checkpoint if checkpoint is not None else torch.load(
+            path, map_location=self.device, weights_only=False
+        )
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.optimiser.load_state_dict(ckpt["optimiser_state_dict"])
         if "lr_scheduler_state_dict" in ckpt:

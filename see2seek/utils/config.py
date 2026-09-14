@@ -14,21 +14,20 @@ Architecture note (ZSON/EmbCLIP-inspired spatial fusion — see gru_policy.py):
         conv kernel/stride in gru_policy.py.
     CLS branch      (trainable projection, ablatable via use_cls): 64-dim
         DINOv2 CLS token (768) -> Linear/LayerNorm/ELU -> 64
-    Goal branch     (fed raw, no projection): 512-dim
-        CLIP ViT-B/32 image/text embedding, unchanged.
+    Goal branch     (trainable projection): 512-dim
+        CLIP ViT-B/32 image/text embedding -> Linear/LayerNorm/ELU.
     Previous-action branch: 32-dim
         Learned embedding of the last discrete action.
 
-    policy_input_dim = spatial_compressed_dim
-                      + (cls_proj_dim if use_cls else 0)
-                      + goal_embed_dim
-                      + action_embed_dim
-                      = 1568 + 64 + 512 + 32 = 2176   (use_cls=True, default)
-                      = 1568 +  0 + 512 + 32 = 2112   (use_cls=False)
+    Default fusion: 1568 spatial + 64 CLS + 512 goal + 128 memory
+                    + 32 previous action + 32 ego-pose = 2336 dimensions.
+    Optional PointGoal adds another 32 dimensions.
+
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+from pathlib import Path
 
 import torch
 
@@ -44,26 +43,8 @@ class EnvConfig:
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
     split: str = "train"                    # "train" | "val" | "test"
-    # split: str = "val"
-
-
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/train"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/train/episodes"
-
-    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train"
-    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/train/episodes"
-
-    # scene_dataset_path: str = "/home/dipin/See2Seek/imagenav_dataset/val"
-    # episodes_path: str = "/home/dipin/See2Seek/imagenav_dataset/val/episodes"
-
-    # scene_dataset_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val"
-    # episodes_path: str = "/home/adhikari_dipin2_gmail_com/see2seek/dataset/val/episodes"
-
-    scene_dataset_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train"
-    episodes_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/train/episodes"
-
-    # scene_dataset_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/val"
-    # episodes_path: str = "/home/doece5/see2seek_dipin_adhikari/see2seek/dataset/val/episodes"
+    scene_dataset_path: str = str(Path(__file__).resolve().parents[2] / "dataset/train")
+    episodes_path: str = str(Path(__file__).resolve().parents[2] / "dataset/train/episodes")
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -158,7 +139,8 @@ class EncoderConfig:
     goal_normalize: bool = True
 
     # --- Episodic memory (attention over past CLS tokens) ---
-    memory_size: int = 128                 # circular buffer length (past CLS tokens stored)
+    use_episodic_memory: bool = True       # ablation: remove memory module and GRU branch
+    memory_size: int = 128                 # rolling buffer length (past CLS tokens stored)
     memory_proj_dim: int = 128             # output dim of memory attention readout
 
     # --- Previous-action embedding ---
@@ -183,13 +165,14 @@ class EncoderConfig:
     def policy_input_dim(self) -> int:
         egopose_dim = self.egopose_embed_dim if self.use_egopose else 0
         pointgoal_dim = self.pointgoal_embed_dim if self.with_pointgoal else 0
+        memory_dim = self.memory_proj_dim if self.use_episodic_memory else 0
         if self.obs_encoder_type == "clip":
-            return (self.clip_obs_proj_dim + self.goal_embed_dim
+            return (self.clip_obs_proj_dim + self.goal_proj_dim + memory_dim
                     + self.action_embed_dim + pointgoal_dim + egopose_dim)
         else:
             cls_dim = self.cls_proj_dim if self.use_cls else 0
             return (self.spatial_compressed_dim + cls_dim + self.goal_proj_dim
-                    + self.memory_proj_dim
+                    + memory_dim
                     + self.action_embed_dim + pointgoal_dim + egopose_dim)
 
 

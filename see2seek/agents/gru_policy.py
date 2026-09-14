@@ -108,7 +108,7 @@ class EpisodicMemory(nn.Module):
     """
     Position-augmented episodic memory via cross-attention.
 
-    Stores (CLS_token, dead_reckoned_pose) pairs in a circular buffer.
+    Stores (CLS_token, dead_reckoned_pose) pairs in a rolling buffer.
     Query: current CLS token + current pose (projected)
     Keys/Values: past CLS tokens + past poses (projected)
     Output: 128-dim memory context vector
@@ -234,6 +234,7 @@ class GRUActorCritic(nn.Module):
         memory_proj_dim: int = 128,
         actor_hidden_dim: int = 256,
         critic_hidden_dim: int = 256,
+        use_episodic_memory: bool = True,
     ) -> None:
         super().__init__()
 
@@ -248,8 +249,11 @@ class GRUActorCritic(nn.Module):
         self.pointgoal_embed_dim = pointgoal_embed_dim
         self.egopose_embed_dim = egopose_embed_dim
         self.use_egopose = use_egopose
+        self.use_episodic_memory = use_episodic_memory
         self.with_pointgoal = with_pointgoal
         self.memory_size = memory_size
+        if use_episodic_memory and memory_size < 1:
+            raise ValueError("memory_size must be positive")
         self.memory_proj_dim = memory_proj_dim
         self.dino_cls_dim = dino_cls_dim
 
@@ -277,9 +281,10 @@ class GRUActorCritic(nn.Module):
         self.goal_proj = LinearNormAct(goal_embed_dim, goal_proj_dim)
 
         # ---- Episodic memory ----
-        self.episodic_memory = EpisodicMemory(
-            cls_dim=dino_cls_dim if obs_encoder_type == "dino" else clip_obs_dim,
-            memory_proj_dim=memory_proj_dim,
+        self.memory_cls_dim = dino_cls_dim if obs_encoder_type == "dino" else clip_obs_dim
+        self.episodic_memory = (
+            EpisodicMemory(cls_dim=self.memory_cls_dim, memory_proj_dim=memory_proj_dim)
+            if use_episodic_memory else None
         )
 
         # ---- Previous-action embedding ----
@@ -310,7 +315,7 @@ class GRUActorCritic(nn.Module):
             + (pointgoal_embed_dim if with_pointgoal else 0)
             + (egopose_embed_dim if use_egopose else 0)
         )
-        self.policy_input_dim = self._base_input_dim + memory_proj_dim
+        self.policy_input_dim = self._base_input_dim + (memory_proj_dim if use_episodic_memory else 0)
 
         # ---- 2-layer GRU ----
         self.gru = nn.GRU(
@@ -340,7 +345,7 @@ class GRUActorCritic(nn.Module):
             f"GRUActorCritic [{obs_encoder_type}] — "
             f"policy_input_dim={self.policy_input_dim} "
             f"(obs={obs_dim}, goal_proj={goal_proj_dim}, "
-            f"memory={memory_proj_dim}, "
+            f"memory={memory_proj_dim if use_episodic_memory else 0}, "
             f"prev_action={num_action_embed}{pg_str}{egopose_str}), "
             f"GRU={num_recurrent_layers}x{hidden_size}, actions={num_actions}"
         )
@@ -395,10 +400,11 @@ class GRUActorCritic(nn.Module):
                     nn.init.orthogonal_(m.weight)
                     nn.init.zeros_(m.bias)
 
-        for m in self.episodic_memory.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
-                nn.init.zeros_(m.bias)
+        if self.episodic_memory is not None:
+            for m in self.episodic_memory.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight)
+                    nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
     # Base fusion (everything except memory — computed for all steps at once)
@@ -499,6 +505,19 @@ class GRUActorCritic(nn.Module):
         )
         base_feat = base_feat.view(chunk_len, num_chunks, -1)
 
+        # Memory ablation removes its features and parameters entirely.
+        # The recurrent state still resets at episode boundaries.
+        if not self.use_episodic_memory:
+            masks_seq = masks.view(chunk_len, num_chunks, 1)
+            h = hidden
+            outputs = []
+            for t in range(chunk_len):
+                h = h * masks_seq[t].unsqueeze(0)
+                out, h = self.gru(base_feat[t].unsqueeze(0), h)
+                outputs.append(out.squeeze(0))
+            gru_out = torch.stack(outputs).reshape(total_B, self.hidden_size)
+            return self.actor(gru_out), self.critic(gru_out), h, None, None, None
+
         # Reshape CLS and poses for per-step memory operations
         cls_seq = cls_embed.view(chunk_len, num_chunks, cls_dim)
         masks_seq = masks.view(chunk_len, num_chunks, 1)
@@ -531,9 +550,6 @@ class GRUActorCritic(nn.Module):
                 device=cls_embed.device, dtype=cls_embed.dtype,
             )
 
-        # Track write position in circular buffer
-        write_pos = memory_mask.sum(dim=1).clamp(max=self.memory_size - 1).long()
-
         # 3. Step through time with memory
         h = hidden
         outputs = []
@@ -547,7 +563,6 @@ class GRUActorCritic(nn.Module):
                 memory_buffer[episode_start] = 0
                 memory_pose_buffer[episode_start] = 0
                 memory_mask[episode_start] = False
-                write_pos[episode_start] = 0
 
             # Compute memory readout via cross-attention
             has_memory = memory_mask.any(dim=1)
@@ -565,15 +580,18 @@ class GRUActorCritic(nn.Module):
                 )
                 memory_context[has_memory] = F.normalize(mem_out, p=2, dim=-1)
 
-            # Write current CLS + pose to buffer (detached)
-            idx_cls = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, cls_dim)
-            memory_buffer.scatter_(1, idx_cls, cls_seq[t].detach().unsqueeze(1))
-
-            idx_pose = write_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, EpisodicMemory.POSE_DIM)
-            memory_pose_buffer.scatter_(1, idx_pose, pose_seq[t].detach().unsqueeze(1))
-
-            memory_mask.scatter_(1, write_pos.unsqueeze(1), True)
-            write_pos = (write_pos + 1) % self.memory_size
+            # Keep slots in chronological order across both single-step calls
+            # and sequence replay. No cursor needs to be inferred from a full mask.
+            memory_buffer = torch.cat(
+                [memory_buffer[:, 1:], cls_seq[t].detach().unsqueeze(1)], dim=1
+            )
+            memory_pose_buffer = torch.cat(
+                [memory_pose_buffer[:, 1:], pose_seq[t].detach().unsqueeze(1)], dim=1
+            )
+            memory_mask = torch.cat([
+                memory_mask[:, 1:],
+                torch.ones(num_chunks, 1, device=cls_embed.device, dtype=torch.bool),
+            ], dim=1)
 
             # Concatenate base features + memory context
             x_t = torch.cat([base_feat[t], memory_context], dim=-1)
@@ -641,9 +659,8 @@ class GRUActorCritic(nn.Module):
         poses: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Re-evaluate actions for PPO update. Memory is built from scratch
-        within each chunk (first steps have limited history, which is
-        acceptable since the GRU hidden state carries longer context).
+        Re-evaluate actions using the hidden state and episodic memory
+        captured before the first step of each rollout chunk.
 
         Returns:
             log_probs: (total_B,)
@@ -667,6 +684,16 @@ class GRUActorCritic(nn.Module):
         """Return zeroed GRU hidden state for episode start."""
         return torch.zeros(
             self.num_recurrent_layers, batch_size, self.hidden_size, device=device
+        )
+
+    def get_initial_memory(self, batch_size: int, device: torch.device):
+        """Allocate memory only for policies that use episodic attention."""
+        if not self.use_episodic_memory:
+            return None, None, None
+        return (
+            torch.zeros(batch_size, self.memory_size, self.memory_cls_dim, device=device),
+            torch.zeros(batch_size, self.memory_size, EpisodicMemory.POSE_DIM, device=device),
+            torch.zeros(batch_size, self.memory_size, dtype=torch.bool, device=device),
         )
 
     @torch.no_grad()
@@ -705,7 +732,7 @@ class GRUActorCritic(nn.Module):
             ego_feat = F.normalize(self.egopose_proj(poses), p=2, dim=-1)
             norms["egopose"] = ego_feat.norm(dim=-1).mean().item()
 
-        if memory_buffer is not None and memory_mask is not None:
+        if self.use_episodic_memory and memory_buffer is not None and memory_mask is not None:
             has_memory = memory_mask.any(dim=1)
             if has_memory.any() and poses is not None:
                 mem_out = self.episodic_memory(
@@ -749,6 +776,7 @@ def build_policy(cfg, device: str = "cuda") -> GRUActorCritic:
         egopose_input_dim=getattr(enc, "egopose_input_dim", 4),
         egopose_embed_dim=getattr(enc, "egopose_embed_dim", 32),
         use_egopose=getattr(enc, "use_egopose", True),
+        use_episodic_memory=getattr(enc, "use_episodic_memory", True),
         with_pointgoal=getattr(enc, "with_pointgoal", False),
         memory_size=getattr(enc, "memory_size", 64),
         memory_proj_dim=getattr(enc, "memory_proj_dim", 128),
