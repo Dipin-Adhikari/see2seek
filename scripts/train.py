@@ -20,15 +20,24 @@ import logging
 import os
 from datetime import datetime
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
+# Keep the entry point and spawned workers on this checkout's code, even when
+# a previously installed copy also exists in the virtual environment.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="See to Seek — PPO Training")
     p.add_argument("--config", default=None, help="Path to YAML config file")
+    p.add_argument("--scene-dataset-path", "--scene_dataset_path", default=None,
+                   help="Dataset split directory containing embeddings.pt (default: dataset/train)")
+    p.add_argument("--episodes-path", "--episodes_path", default=None,
+                   help="Episode directory or JSON file (defaults to <dataset split>/episodes)")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     p.add_argument("--obs_encoder", default=None, choices=["dino", "clip"],
                    help="Observation encoder: dino (DINOv2 ViT-B/14) or clip (CLIP ViT-B/32 baseline)")
@@ -145,6 +154,12 @@ def main() -> None:
 
     # ---- Apply CLI overrides ----
     apply_ablation_args(cfg, args)
+    if args.scene_dataset_path:
+        cfg.env.scene_dataset_path = args.scene_dataset_path
+        if args.episodes_path is None:
+            cfg.env.episodes_path = str(Path(args.scene_dataset_path) / "episodes")
+    if args.episodes_path:
+        cfg.env.episodes_path = args.episodes_path
     if args.with_pointgoal:
         cfg.encoder.with_pointgoal = True
     if args.obs_encoder is not None:
@@ -158,6 +173,14 @@ def main() -> None:
         # Minimal run to check the pipeline end-to-end
         apply_debug_config(cfg)
         logger.info("DEBUG MODE: 2 updates, 2 envs, W&B disabled")
+
+    from see2seek.utils.config import validate_dataset_paths
+    try:
+        validate_dataset_paths(cfg)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    logger.info(f"Dataset directory: {cfg.env.scene_dataset_path}")
+    logger.info(f"Episodes: {cfg.env.episodes_path}")
 
     output_root = select_training_output(
         cfg, args.resume, args.output_dir, args.use_current_output

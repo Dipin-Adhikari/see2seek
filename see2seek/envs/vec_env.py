@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from .robothor_env import RoboTHOREnv
+from see2seek.utils.config import validate_dataset_paths
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ _WORKER_DEAD_EXCEPTIONS = (BrokenPipeError, EOFError, ConnectionError, OSError)
 class VecEnv:
     def __init__(self, cfg, num_envs: Optional[int] = None,
                  episode_shards=None, goal_embeddings=None) -> None:
+        validate_dataset_paths(cfg, require_image_embeddings=goal_embeddings is None)
         self.cfg = cfg
         self.num_envs = num_envs or cfg.env.num_envs
         self._episode_shards = episode_shards

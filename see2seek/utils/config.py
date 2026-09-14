@@ -43,8 +43,9 @@ class EnvConfig:
     # --- Scene / dataset ---
     dataset: str = "robothor"               # "robothor" or "hm3d"
     split: str = "train"                    # "train" | "val" | "test"
-    scene_dataset_path: str = str(Path(__file__).resolve().parents[2] / "dataset/train")
-    episodes_path: str = str(Path(__file__).resolve().parents[2] / "dataset/train/episodes")
+    # Relative to the launch directory, not the installed package location.
+    scene_dataset_path: str = "dataset/train"
+    episodes_path: str = "dataset/train/episodes"
 
     # --- Observation ---
     image_width: int = 224                  # must match DINOv2 expected input
@@ -303,6 +304,34 @@ class Config:
 # ---------------------------------------------------------------------------
 # YAML loader
 # ---------------------------------------------------------------------------
+
+def validate_dataset_paths(cfg: Config, require_image_embeddings: bool = True) -> None:
+    """Resolve data paths in the parent and fail before models/workers start."""
+    scene_path = Path(cfg.env.scene_dataset_path).expanduser().resolve()
+    episodes_path = Path(cfg.env.episodes_path).expanduser().resolve()
+    cfg.env.scene_dataset_path = str(scene_path)
+    cfg.env.episodes_path = str(episodes_path)
+
+    missing = []
+    if not scene_path.is_dir():
+        missing.append(f"dataset directory: {scene_path}")
+    if not episodes_path.exists():
+        missing.append(f"episode path: {episodes_path}")
+    elif episodes_path.is_dir() and not any(
+        p.is_file() and (p.name.endswith(".json") or p.name.endswith(".json.gz"))
+        for p in episodes_path.iterdir()
+    ):
+        missing.append(f"episode JSON files in: {episodes_path}")
+    if require_image_embeddings and not (scene_path / "embeddings.pt").is_file():
+        missing.append(f"cached image-goal embeddings: {scene_path / 'embeddings.pt'}")
+    if missing:
+        raise FileNotFoundError(
+            "Dataset is not ready:\n  " + "\n  ".join(missing)
+            + "\nRun from the repository root, or set env.scene_dataset_path and "
+              "env.episodes_path in your YAML config. Training also accepts "
+              "--scene-dataset-path and --episodes-path."
+        )
+
 
 def load_config(yaml_path: str) -> Config:
     """

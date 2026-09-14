@@ -22,3 +22,4 @@ augment_dataset
 .claude
 data_dino_v*/
 .github
+checks

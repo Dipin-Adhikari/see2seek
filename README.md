@@ -77,6 +77,13 @@ Angle-to-goal shaping is only active within 1m of the goal, encouraging the agen
 
 ## Training
 
+Run training from the repository root. Default data paths are `dataset/train`
+and `dataset/train/episodes`, resolved from the launch directory. For another
+location, use `--scene-dataset-path /path/to/dataset/train` (episodes default to
+its `episodes` subdirectory), or set the paths in your YAML config. Data is
+checked before W&B, model loading, or worker startup. ImageNav still requires
+`embeddings.pt` for image goals when episodic memory is disabled.
+
 ```bash
 # Train (DINOv2 obs encoder)
 python scripts/train.py
@@ -198,6 +205,8 @@ See2Seek/
 ├── requirements.txt
 └── setup.py
 ```
+
+Startup regression checks: `python -m unittest discover -s checks -p 'test_startup.py' -v`.
 
 ## References
 

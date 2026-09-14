@@ -339,13 +339,13 @@ class GRUActorCritic(nn.Module):
 
         self._init_weights()
 
-        egopose_str = f", egopose={egopose_embed_dim}" if use_egopose else ""
+        egopose_str = f", direct_egopose={egopose_embed_dim if use_egopose else 'disabled'}"
         pg_str = f", pointgoal={pointgoal_embed_dim}" if with_pointgoal else ""
         logger.info(
             f"GRUActorCritic [{obs_encoder_type}] — "
             f"policy_input_dim={self.policy_input_dim} "
             f"(obs={obs_dim}, goal_proj={goal_proj_dim}, "
-            f"memory={memory_proj_dim if use_episodic_memory else 0}, "
+            f"episodic_memory={memory_proj_dim if use_episodic_memory else 'disabled'}, "
             f"prev_action={num_action_embed}{pg_str}{egopose_str}), "
             f"GRU={num_recurrent_layers}x{hidden_size}, actions={num_actions}"
         )

@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from see2seek.utils.config import Config
+from see2seek.utils.config import Config, validate_dataset_paths
 from see2seek.models.encoders.dino_encoder import DINOv2Encoder
 from see2seek.models.encoders.clip_encoder import CLIPGoalEncoder
 from see2seek.envs.vec_env import make_vec_envs
@@ -73,6 +73,8 @@ class PPOTrainer:
                             f"Cannot resume with a different {flag} setting: the GRU input size changes. "
                             "Start a new ablation run, or use the checkpoint's original flags."
                         )
+
+        validate_dataset_paths(cfg)
 
         # ---- Logging ----
         self._setup_logging()
