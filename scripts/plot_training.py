@@ -1,10 +1,37 @@
-"""Plot training metrics from log files."""
+"""Plot training metrics from a log file or directory.
+
+Examples:
+    python scripts/plot_training.py --log_dir data_dino_baseline/logs
+    python scripts/plot_training.py --log_dir data_dino_baseline/logs/train
+    python scripts/plot_training.py --log-file path/to/train_20260914_141157.log
+
+The default output is training_curves.png in the selected directory, or beside
+the selected file. Without a log path, use logging.log_dir from the config.
+"""
 
 import re
 import sys
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
+
+# Use this checkout's configuration when launched as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def find_log_files(log_path):
+    """Accept a single log, a logs directory, or its train subdirectory."""
+    log_path = Path(log_path).expanduser()
+    if log_path.is_file():
+        return [log_path]
+    if not log_path.is_dir():
+        raise FileNotFoundError(f"Log path does not exist: {log_path}")
+    return sorted({
+        path
+        for pattern in ("train_*.log", "train/train_*.log")
+        for path in log_path.glob(pattern)
+        if path.is_file()
+    })
 
 
 def parse_log(log_path):
@@ -233,6 +260,7 @@ def plot_metrics(metrics, actions, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to: {save_path}")
+        plt.close(fig)
     else:
         plt.show()
 
@@ -242,12 +270,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Plot training curves from log files")
     parser.add_argument("--config", default=None, help="Path to YAML config (uses log_dir from config)")
-    parser.add_argument("--log_dir", default=None, help="Override log directory path")
+    parser.add_argument("--log_dir", "--log-dir", "--log-file", default=None,
+                        help="Log file, logs directory, or logs/train directory")
     parser.add_argument("--output", default=None, help="Override output image path")
     args = parser.parse_args()
 
     if args.log_dir:
-        log_dir = Path(args.log_dir)
+        log_dir = Path(args.log_dir).expanduser()
     elif args.config:
         from see2seek.utils.config import load_config
         cfg = load_config(args.config)
@@ -257,10 +286,13 @@ if __name__ == "__main__":
         cfg = Config()
         log_dir = Path(cfg.logging.log_dir)
 
-    log_files = sorted(log_dir.glob("train/train_*.log"))
+    try:
+        log_files = find_log_files(log_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
 
     if not log_files:
-        print(f"No log files found in {log_dir}/")
+        print(f"No training logs found in {log_dir}; looked for train_*.log and train/train_*.log")
         sys.exit(1)
 
     print(f"Found {len(log_files)} log file(s) in {log_dir}, parsing all...")
@@ -274,5 +306,7 @@ if __name__ == "__main__":
     print(f"Steps: {metrics['steps'][0]:,} -> {metrics['steps'][-1]:,}")
     print(f"Latest SR={metrics['SR'][-1]:.3f}  SPL={metrics['SPL'][-1]:.3f}  Reward={metrics['reward'][-1]:.3f}")
 
-    save_path = args.output or str(log_dir / "training_curves.png")
+    output_dir = log_dir.parent if log_dir.is_file() else log_dir
+    save_path = Path(args.output).expanduser() if args.output else output_dir / "training_curves.png"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     plot_metrics(metrics, actions, save_path=save_path)

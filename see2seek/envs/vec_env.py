@@ -28,10 +28,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .robothor_env import RoboTHOREnv
+from .robothor_env import InvalidEpisodeStart, RoboTHOREnv
 from see2seek.utils.config import validate_dataset_paths
 
 logger = logging.getLogger(__name__)
+
+
+def _reset_evaluation_env(env):
+    """Advance a finite shard past invalid poses and return every exclusion."""
+    info = {"invalid_episodes": [], "exhausted": False}
+    while True:
+        try:
+            return env.reset(), info
+        except InvalidEpisodeStart as exc:
+            info["invalid_episodes"].append(exc.info)
+        except StopIteration:
+            info["exhausted"] = True
+            return None, info
 
 
 def _worker(
@@ -65,20 +78,27 @@ def _worker(
 
         try:
             if cmd == "reset":
-                obs = env.reset()
-                shared_rgb.copy_(obs["rgb"])
-                shared_goal.copy_(obs["goal"])
-                shared_pointgoal.copy_(obs["pointgoal"])
-                conn.send("ok")
+                if episodes is None:
+                    obs, reset_info = env.reset(), None
+                else:
+                    obs, reset_info = _reset_evaluation_env(env)
+                if obs is not None:
+                    shared_rgb.copy_(obs["rgb"])
+                    shared_goal.copy_(obs["goal"])
+                    shared_pointgoal.copy_(obs["pointgoal"])
+                conn.send("ok" if reset_info is None else ("ok", reset_info))
 
             elif cmd == "step":
                 action = args[0]
                 obs, reward, done, info = env.step(action)
                 if done:
-                    try:
+                    if episodes is None:
                         obs = env.reset()
-                    except StopIteration:
-                        info["exhausted"] = True
+                    else:
+                        next_obs, reset_info = _reset_evaluation_env(env)
+                        info.update(reset_info)
+                        if next_obs is not None:
+                            obs = next_obs
                 shared_rgb.copy_(obs["rgb"])
                 shared_goal.copy_(obs["goal"])
                 shared_pointgoal.copy_(obs["pointgoal"])
@@ -127,6 +147,7 @@ class VecEnv:
         self._episode_shards = episode_shards
         self._goal_embeddings = goal_embeddings
         self._inactive = set()
+        self._invalid_episodes = []
 
         self._parent_conns: List[mp.connection.Connection] = []
         self._processes: List[mp.Process] = []
@@ -218,6 +239,7 @@ class VecEnv:
 
     def reset_all(self) -> Dict[str, torch.Tensor]:
         dead = set()
+        errors = {}
         for i, conn in enumerate(self._parent_conns):
             try:
                 conn.send(("reset",))
@@ -231,10 +253,15 @@ class VecEnv:
                 result = conn.recv()
                 if isinstance(result, tuple) and result[0] == "__error__":
                     dead.add(i)
+                    errors[i] = result[2]
+                elif isinstance(result, tuple) and result[0] == "ok":
+                    self._record_reset_info(i, result[1])
             except _WORKER_DEAD_EXCEPTIONS:
                 dead.add(i)
 
         for i in dead:
+            if self._episode_shards is not None:
+                raise RuntimeError(f"Evaluation worker {i} failed during reset: {errors.get(i, 'connection closed')}")
             self._respawn_worker(i)
 
         return self._stack_obs()
@@ -243,6 +270,7 @@ class VecEnv:
         self, actions: torch.Tensor
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, List[Dict]]:
         dead: set = set()
+        errors = {}
 
         for i, (conn, action) in enumerate(zip(self._parent_conns, actions.tolist())):
             if i in self._inactive:
@@ -263,17 +291,17 @@ class VecEnv:
                 result = conn.recv()
                 if isinstance(result, tuple) and len(result) >= 3 and result[0] == "__error__":
                     dead.add(i)
+                    errors[i] = result[2]
                 else:
                     results[i] = result
-                    if result[3].get("exhausted", False):
-                        self._inactive.add(i)
+                    self._record_reset_info(i, result[3])
             except _WORKER_DEAD_EXCEPTIONS:
                 dead.add(i)
 
         for i in dead:
-            logger.error(
-                f"VecEnv: worker {i} died (Unity segfault or crash), respawning..."
-            )
+            if self._episode_shards is not None:
+                raise RuntimeError(f"Evaluation worker {i} failed during step: {errors.get(i, 'connection closed')}")
+            logger.error(f"VecEnv: worker {i} failed, respawning...")
             self._respawn_worker(i)
             results[i] = ("ok", 0.0, True, {
                 "success": False, "done": True, "num_steps": 0,
@@ -286,6 +314,18 @@ class VecEnv:
         infos   = [r[3] for r in results]
 
         return self._stack_obs(), rewards, dones, infos
+
+    def _record_reset_info(self, worker_id, info):
+        if info.get("exhausted", False):
+            self._inactive.add(worker_id)
+        invalid = info.get("invalid_episodes", [])
+        if invalid:
+            self._invalid_episodes.extend(invalid)
+
+    def pop_invalid_episodes(self):
+        """Drain newly rejected start poses once, including initial reset failures."""
+        invalid, self._invalid_episodes = self._invalid_episodes, []
+        return invalid
 
     @property
     def all_exhausted(self) -> bool:

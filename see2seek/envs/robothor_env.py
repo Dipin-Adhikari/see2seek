@@ -91,6 +91,19 @@ ACTIONS = {
 _CONTROLLER_DEAD_EXCEPTIONS = (BrokenPipeError, ConnectionError, EOFError, OSError)
 
 
+class InvalidEpisodeStart(RuntimeError):
+    """A dataset start pose rejected by TeleportFull during evaluation."""
+
+    def __init__(self, episode: Dict, reason: str, shortest_path_length: float):
+        super().__init__(reason)
+        self.info = {
+            "episode_id": episode["id"],
+            "scene_id": episode["scene"],
+            "reason": reason,
+            "shortest_path_length": round(shortest_path_length, 3),
+        }
+
+
 class ControllerCrashError(RuntimeError):
     """Raised internally when the AI2-THOR/Unity backend has died and could
     not be recovered within a single episode's controller restart."""
@@ -370,6 +383,10 @@ class RoboTHOREnv:
         `_max_reset_retries` consecutive attempts, instead of raising and
         killing the worker subprocess.
 
+        Evaluation uses a finite queue instead: a rejected TeleportFull raises
+        InvalidEpisodeStart so the caller can report its ID and exclude it from
+        metrics. Renderer failures remain errors; exhausted shards raise StopIteration.
+
         Also resilient to the controller itself being dead (e.g. called
         right after a mid-episode Unity crash during step()): a
         BrokenPipeError/OSError here triggers a controller restart and a
@@ -455,7 +472,9 @@ class RoboTHOREnv:
                     f"{event.metadata.get('errorMessage')}"
                 )
                 if self._evaluation:
-                    raise RuntimeError(last_error)
+                    raise InvalidEpisodeStart(
+                        ep, last_error, self._compute_path_length(ep["shortest_path"])
+                    )
                 logger.warning(f"{last_error} — skipping to next episode")
                 attempt += 1
                 continue

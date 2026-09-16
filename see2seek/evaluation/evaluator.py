@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -99,14 +100,14 @@ class Evaluator:
         num_episodes: Optional[int] = None,
         log_file: Optional[str] = None,
         zero_pointgoal: bool = False,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, object]:
         """
         Run parallel evaluation and return metric dict.
 
         Args:
             split:          Dataset split ("val" or "test").
             task:           "imagenav" or "objectnav".
-            num_episodes:   Max episodes to evaluate. None → full split.
+            num_episodes:   Max requested episodes, including invalid starts. None → full split.
             log_file:       Path to write per-episode logs. None → auto-generated.
 
         Returns:
@@ -160,6 +161,28 @@ class Evaluator:
         all_collisions = []
         all_path_lengths = []
         all_shortest_path_lengths = []
+        requested_ids = [ep["id"] for ep in episodes]
+        requested_id_set = set(requested_ids)
+        accounted_ids = set()
+        completed_ids = []
+        invalid_episodes = []
+        report_path = Path(log_file).with_suffix(".episodes.json")
+        evaluation_complete = False
+
+        def account_episode(episode_id):
+            if episode_id not in requested_id_set or episode_id in accounted_ids:
+                raise RuntimeError(f"Unexpected or duplicate evaluation episode: {episode_id}")
+            accounted_ids.add(episode_id)
+
+        def collect_invalid_starts():
+            for invalid in vec_env.pop_invalid_episodes():
+                account_episode(invalid["episode_id"])
+                invalid_episodes.append(invalid)
+                eval_logger.warning(
+                    "[invalid-start] scene=%s id=%s excluded from SR/SPL: %s",
+                    invalid["scene_id"], invalid["episode_id"],
+                    invalid["reason"].split(". trace:")[0].replace("\n", " "),
+                )
 
         vec_env = None
         try:
@@ -169,6 +192,7 @@ class Evaluator:
 
             # Initial reset
             obs_dict = vec_env.reset_all()
+            collect_invalid_starts()
 
             # Policy state
             hidden = self.policy.get_initial_hidden(self.num_envs, self.device)
@@ -189,9 +213,9 @@ class Evaluator:
             total_steps = 0
             start_time = time.time()
 
-            while True:
-                if num_episodes is not None and episode_count >= num_episodes:
-                    break
+            while len(accounted_ids) < num_episodes:
+                if vec_env.all_exhausted:
+                    raise RuntimeError("Evaluation exhausted before all requested episodes were accounted for")
 
                 with torch.no_grad():
                     rgb = obs_dict["rgb"].to(self.device)
@@ -218,6 +242,7 @@ class Evaluator:
                     actions = dist.sample()
 
                 obs_dict, rewards, dones, infos = vec_env.step(actions)
+                collect_invalid_starts()
 
                 # Dead-reckon pose update
                 cos_r = math.cos(math.radians(self.cfg.env.rotate_degrees))
@@ -261,6 +286,8 @@ class Evaluator:
                         spl = info.get("spl", 0.0)
                         ep_steps = info.get("num_steps", 0)
                         ep_id = info.get("episode_id", "?")
+                        account_episode(ep_id)
+                        completed_ids.append(ep_id)
                         scene_id = info.get("scene_id", "?")
                         collisions = info.get("collisions", 0)
                         path_len = info.get("path_length", 0.0)
@@ -302,8 +329,6 @@ class Evaluator:
                 )
                 prev_actions = actions
                 masks = new_masks
-                if vec_env.all_exhausted and episode_count < num_episodes:
-                    raise RuntimeError("Evaluation ended before all requested episodes completed")
 
 
             # Final results
@@ -317,9 +342,12 @@ class Evaluator:
             mean_sp = sum(all_shortest_path_lengths) / n
 
             result = {
-                "sr": round(sr, 4),
-                "spl": round(spl_mean, 4),
+                "sr": round(sr, 4) if successes else None,
+                "spl": round(spl_mean, 4) if successes else None,
                 "num_episodes": episode_count,
+                "num_requested_episodes": num_episodes,
+                "num_invalid_episodes": len(invalid_episodes),
+                "episode_report": str(report_path),
                 "mean_steps": round(mean_steps, 1),
                 "mean_collisions": round(mean_collisions, 1),
                 "mean_path_length": round(mean_path, 2),
@@ -329,9 +357,9 @@ class Evaluator:
             }
 
             eval_logger.info(f"\n=== Evaluation Complete ===")
-            eval_logger.info(f"  Episodes:       {episode_count}")
-            eval_logger.info(f"  SR:             {sr:.4f}")
-            eval_logger.info(f"  SPL:            {spl_mean:.4f}")
+            eval_logger.info(f"  Episodes:       {num_episodes} requested, {episode_count} scored, {len(invalid_episodes)} invalid starts")
+            eval_logger.info("  SR:             %s", f"{sr:.4f}" if successes else "N/A (no valid episodes)")
+            eval_logger.info("  SPL:            %s", f"{spl_mean:.4f}" if successes else "N/A (no valid episodes)")
             eval_logger.info(f"  Mean steps:     {mean_steps:.1f}")
             eval_logger.info(f"  Mean collisions:{mean_collisions:.1f}")
             eval_logger.info(f"  Mean path:      {mean_path:.2f}m (travelled)")
@@ -378,13 +406,43 @@ class Evaluator:
             result["medium_n"] = len(medium)
             result["hard_n"] = len(hard)
 
+            def bucket(distance):
+                return "easy" if distance <= 3.0 else "medium" if distance <= 6.0 else "hard"
+
+            for name, indices in (("easy", easy), ("medium", medium), ("hard", hard)):
+                invalid_n = sum(bucket(ep["shortest_path_length"]) == name for ep in invalid_episodes)
+                result[f"invalid_{name}_n"] = invalid_n
+                result[f"requested_{name}_n"] = len(indices) + invalid_n
+                if not indices:
+                    result[f"{name}_sr"] = None
+                eval_logger.info("  %s coverage: %d requested, %d scored, %d invalid starts",
+                                 name, len(indices) + invalid_n, len(indices), invalid_n)
+
+            evaluation_complete = True
+
             return result
 
         finally:
             if vec_env is not None:
                 vec_env.close()
-            eval_logger.removeHandler(file_handler)
-            file_handler.close()
+            report = {
+                "task": task, "split": split,
+                "status": "complete" if evaluation_complete else "incomplete",
+                "invalid_start_policy": "exclude_from_sr_spl",
+                "num_requested_episodes": num_episodes,
+                "num_completed_episodes": len(completed_ids),
+                "num_invalid_episodes": len(invalid_episodes),
+                "requested_episode_ids": requested_ids,
+                "completed_episode_ids": completed_ids,
+                "invalid_episodes": invalid_episodes,
+                "unaccounted_episode_ids": [ep_id for ep_id in requested_ids if ep_id not in accounted_ids],
+            }
+            try:
+                report_path.write_text(json.dumps(report, indent=2) + "\n")
+                eval_logger.info("Episode coverage report: %s", report_path)
+            finally:
+                eval_logger.removeHandler(file_handler)
+                file_handler.close()
 
     # ------------------------------------------------------------------
     # Helpers
