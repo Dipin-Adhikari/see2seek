@@ -37,7 +37,15 @@ All encoders (DINOv2 ViT-B/14, CLIP ViT-B/32) are frozen. Only the spatial CNN, 
 | ![HousePlant](docs/images/trajectory_FloorPlan_Val1_1_HousePlant_3.png) HousePlant | ![BasketBall](docs/images/trajectory_FloorPlan_Val3_5_BasketBall_4.png) BasketBall |
 | ![Laptop](docs/images/trajectory_FloorPlan_Val2_2_Laptop_1.png) Laptop | ![Bowl](docs/images/trajectory_FloorPlan_Val3_4_Bowl_7.png) Bowl |
 
-Green paths = successful trials, red = failed. Light green = oracle shortest path. White circle with green boundary = start, red circle with black boundary = goal, green circle with white boundary = agent stop position when succeed, red circle with white boundary = agent stop when failed.
+| Visual | Meaning |
+|---|---|
+| Light green line | Successful trial |
+| Red line | Failed trial |
+| Dark green line | Oracle shortest path |
+| White circle, green border | Start |
+| Red circle, black border | Goal |
+| Green circle, white border | End: success |
+| Red circle, white border | End: failure |
 
 ## Evaluation Results
 
@@ -45,17 +53,17 @@ Green paths = successful trials, red = failed. Light green = oracle shortest pat
 
 Three variants were trained on ImageNav and compared on the RoboTHOR validation
 split at **5M environment steps**. Their saved configurations
-have matching environment, PPO, and policy settings, with PointGoal disabled;
+have matching environment, PPO, and policy settings,
 the encoder configurations differ only in the ablation switches. Training logs
 record seed 42. All three checkpoints use the same 10M-step learning-rate schedule
 and are evaluated at its 5M point. These are single-run results, not averages
 across seeds.
 
-| Variant / evaluation log | GRU input | Successes / scored | SR (%) | SPL |
+| Variant | GRU input | Successes / scored | SR (%) | SPL |
 |---|---:|---:|---:|---:|
-| [Baseline](data_dino_baseline/logs/val/eval_imagenav_val_20260916_222909.log) | 2176 | 256 / 1723 | 14.86 | **0.0958** |
-| [Ego-pose](data_dino_egopose/logs/val/eval_imagenav_val_20260921_011238.log)  | 2208 | 226 / 1723 | 13.12 | 0.0733 |
-| [Episodic memory](data_dino_episodic_memory/logs/val/eval_imagenav_val_20260921_020720.log) | 2304 | 282 / 1723 | **16.37** | 0.0905 |
+| Baseline | 2176 | 256 / 1723 | 14.86 | **0.0958** |
+| Ego-pose | 2208 | 226 / 1723 | 13.12 | 0.0733 |
+| Episodic memory | 2304 | 282 / 1723 | **16.37** | 0.0905 |
 
 Baseline still includes the recurrent GRU. The episodic-memory variant removes
 only the direct ego-pose branch: its attention still uses poses. The full model
@@ -78,10 +86,10 @@ The selected run (`data_dino_episodic_memory`) continued for approximately anoth
 training result for the selected configuration; the ablation comparison above
 uses the matched 5M checkpoints.
 
-| Task / evaluation log | Successes / scored | SR (%) | SPL |
+| Task | Successes / scored | SR (%) | SPL |
 |---|---:|---:|---:|
-| [ImageNav](data_dino_episodic_memory/logs/val/eval_imagenav_val_20260924_112852.log) | 347 / 1723 | **20.14** | **0.1194** |
-| [ObjectNav (zero-shot)](data_dino_episodic_memory/logs/val/eval_objectnav_val_20260924_121216.log) | 320 / 1723 | 18.57 | 0.1101 |
+| ImageNav | 347 / 1723 | **20.14** | **0.1194** |
+| ObjectNav (zero-shot) | 320 / 1723 | 18.57 | 0.1101 |
 
 ImageNav SR increased from **16.37% to 20.14%** (+3.77 percentage points), and SPL
 from **0.0905 to 0.1194**. ObjectNav uses CLIP text goals without additional
@@ -92,6 +100,20 @@ ObjectNav training.
 | Easy (<=3m) | 30.9 | 0.163 | 28.7 | 0.156 |
 | Medium (3-6m) | 11.7 | 0.090 | 12.0 | 0.089 |
 | Hard (>6m) | 6.9 | 0.054 | 2.9 | 0.020 |
+
+### Training curve of the final model
+
+![Training SR and SPL of the selected episodic-memory attention model](docs/episodic_memory_training_curve.png)
+
+The selected episodic-memory attention model shows an overall upward trend in
+training SR through 10M environment steps. The mean logged training SR rises
+from **24.55% during 8–9M steps to 27.37% during 9–10M steps**. Together with the
+ImageNav validation SR increase from **16.37% at 5M to 20.14% at 10M**, this
+motivates exploring longer training. Further improvement beyond 10M is possible,
+but requires additional compute resources.
+
+Faint lines show logged training metrics over up to 100 recently completed
+episodes; solid lines show a trailing mean over 10 logged points. 
 
 ### Episode coverage and result provenance
 
@@ -164,7 +186,7 @@ Each command still prompts for the output folder. Choose a separate folder for
 each ablation. The equivalent YAML settings are `encoder.use_egopose: false`
 and `encoder.use_episodic_memory: false`.
 
-| DINOv2 variant (PointGoal off) | GRU input dimension |
+| DINOv2 variant | GRU input dimension |
 |---|---:|
 | Full model | 2336 |
 | No direct ego-pose | 2304 |
@@ -214,23 +236,6 @@ report lists requested, completed, invalid, and unaccounted episode IDs.
 - **SR (Success Rate):** Fraction of episodes where agent stops within 1m of goal
 - **SPL (Success weighted by Path Length):** SR penalized by path inefficiency
 
-## Visualization
-
-```bash
-# Single episode, 5 stochastic trials overlaid on AI2-THOR top-down view
-python scripts/visualize_trajectory.py \
-    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
-    --episodes FloorPlan_Val3_2_Apple_6 \
-    --episodes_path /path/to/val/episodes \
-    --scene_dataset_path /path/to/val
-
-# ObjectNav visualization
-python scripts/visualize_trajectory.py \
-    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
-    --task objectnav --use_list \
-    --episodes_path /path/to/val/episodes \
-    --scene_dataset_path /path/to/val
-```
 
 ## Project Structure
 
