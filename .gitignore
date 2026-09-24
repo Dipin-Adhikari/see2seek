@@ -8,11 +8,9 @@ imagenav_dataset/
 test.py
 birds_eye_views
 data
-data_new
-data_new_dr
-data_clip
-data_dino_v3
-data_dino_v4
+data_dino_baseline
+data_dino_egopose
+data_dino_episodic_memory
 tests
 wandb
 dataset

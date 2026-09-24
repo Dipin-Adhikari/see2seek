@@ -6,6 +6,10 @@ Zero-shot embodied navigation in RoboTHOR using frozen DINOv2 + CLIP encoders wi
 
 ![System Architecture](docs/system_architecture.png)
 
+The table describes the full supported architecture. The selected model in the
+experiments below retains episodic memory and disables the direct ego-pose
+branch, giving a **2304-dimensional GRU input**.
+
 | Branch | Source | Output Dim |
 |--------|--------|------------|
 | Spatial | DINOv2 patches (256x768) -> 2-layer CNN | 1568 |
@@ -37,27 +41,72 @@ Green paths = successful trials, red = failed. Light green = oracle shortest pat
 
 ## Evaluation Results
 
-Trained for 10M steps. Difficulty defined by oracle shortest path: easy (<=3m), medium (3-6m), hard (>6m).
+### ImageNav ablation at 5M steps
 
-### ImageNav
+Three variants were trained on ImageNav and compared on the RoboTHOR validation
+split at **5M environment steps**. Their saved configurations
+have matching environment, PPO, and policy settings, with PointGoal disabled;
+the encoder configurations differ only in the ablation switches. Training logs
+record seed 42. All three checkpoints use the same 10M-step learning-rate schedule
+and are evaluated at its 5M point. These are single-run results, not averages
+across seeds.
 
-| Difficulty | Episodes | SR (%) | SPL |
-|-----------|----------|--------|-----|
-| **Overall** | **1740** | **15.4** | **0.094** |
-| Easy (<=3m) | 861 | 23.1 | 0.126 |
-| Medium (3-6m) | 633 | 8.7 | 0.071 |
-| Hard (>6m) | 246 | 5.7 | 0.042 |
+| Variant / evaluation log | GRU input | Successes / scored | SR (%) | SPL |
+|---|---:|---:|---:|---:|
+| [Baseline](data_dino_baseline/logs/val/eval_imagenav_val_20260916_222909.log) | 2176 | 256 / 1723 | 14.86 | **0.0958** |
+| [Ego-pose](data_dino_egopose/logs/val/eval_imagenav_val_20260921_011238.log)  | 2208 | 226 / 1723 | 13.12 | 0.0733 |
+| [Episodic memory](data_dino_episodic_memory/logs/val/eval_imagenav_val_20260921_020720.log) | 2304 | 282 / 1723 | **16.37** | 0.0905 |
 
-### ObjectNav (Zero-Shot)
+Baseline still includes the recurrent GRU. The episodic-memory variant removes
+only the direct ego-pose branch: its attention still uses poses. The full model
+with both branches is not part of this three-variant comparison.
 
-| Difficulty | Episodes | SR (%) | SPL |
-|-----------|----------|--------|-----|
-| **Overall** | **1740** | **17.0** | **0.108** |
-| Easy (<=3m) | 836 | 27.4 | 0.159 |
-| Medium (3-6m) | 649 | 8.2 | 0.069 |
-| Hard (>6m) | 255 | 5.1 | 0.040 |
+**Episodic memory was selected for continued training because it achieved the
+highest validation SR**, 1.51 percentage points above baseline. Baseline achieved
+the highest SPL at 5M, so episodic memory did not lead on both metrics.
 
-**Note:** ObjectNav's higher overall SR (17.0% vs 15.4%) is driven almost entirely by easy episodes (27.4% SR). On medium and hard episodes, ObjectNav performs worse than ImageNav (8.2%/5.1% vs 8.7%/5.7%), indicating the agent exploits short-distance episodes where CLIP text-to-vision alignment happens to work well, but struggles with longer-distance navigation that requires sustained goal-directed behavior.
+| Variant | Easy SR (%) | Easy SPL | Medium SR (%) | Medium SPL | Hard SR (%) | Hard SPL |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 24.7 | 0.144 | 7.9 | 0.069 | 1.1 | 0.010 |
+| Ego-pose | 22.4 | 0.114 | 6.4 | 0.050 | 0.4 | 0.003 |
+| Episodic memory | 29.2 | 0.152 | 5.9 | 0.045 | 1.5 | 0.010 |
+
+### Selected episodic-memory model at 10M steps
+
+The selected run (`data_dino_episodic_memory`) continued for approximately another
+5M steps, reaching **10M total environment steps**. This is an extended
+training result for the selected configuration; the ablation comparison above
+uses the matched 5M checkpoints.
+
+| Task / evaluation log | Successes / scored | SR (%) | SPL |
+|---|---:|---:|---:|
+| [ImageNav](data_dino_episodic_memory/logs/val/eval_imagenav_val_20260924_112852.log) | 347 / 1723 | **20.14** | **0.1194** |
+| [ObjectNav (zero-shot)](data_dino_episodic_memory/logs/val/eval_objectnav_val_20260924_121216.log) | 320 / 1723 | 18.57 | 0.1101 |
+
+ImageNav SR increased from **16.37% to 20.14%** (+3.77 percentage points), and SPL
+from **0.0905 to 0.1194**. ObjectNav uses CLIP text goals without additional
+ObjectNav training.
+
+| Difficulty | ImageNav SR (%) | ImageNav SPL | ObjectNav SR (%) | ObjectNav SPL |
+|---|---:|---:|---:|---:|
+| Easy (<=3m) | 30.9 | 0.163 | 28.7 | 0.156 |
+| Medium (3-6m) | 11.7 | 0.090 | 12.0 | 0.089 |
+| Hard (>6m) | 6.9 | 0.054 | 2.9 | 0.020 |
+
+### Episode coverage and result provenance
+
+All five completed evaluations above contain the **same 1723 unique scored
+episode IDs**. Each requested 1740 episodes and excluded the same 17 invalid
+start poses from SR/SPL, without replacing or repeating episodes. Difficulty is
+defined by oracle shortest-path length.
+
+| Difficulty | Requested | Invalid starts | Scored |
+|---|---:|---:|---:|
+| Easy (<=3m) | 831 | 5 | 826 |
+| Medium (3-6m) | 631 | 8 | 623 |
+| Hard (>6m) | 278 | 4 | 274 |
+| **Total** | **1740** | **17** | **1723** |
+
 
 ## Reward Function
 
@@ -88,8 +137,9 @@ checked before W&B, model loading, or worker startup. ImageNav still requires
 # Train (DINOv2 obs encoder)
 python scripts/train.py
 
-# Resume from checkpoint
-python scripts/train.py --resume data_dino_v7/checkpoints/checkpoint_000010000000.pth
+# Continue the selected episodic-memory variant
+python scripts/train.py --no-egopose \
+    --resume data_dino_episodic_memory/checkpoints/checkpoint_000005001216.pth
 
 # Debug mode (2 envs, 2 updates, no W&B)
 python scripts/train.py --debug
@@ -98,13 +148,15 @@ python scripts/train.py --debug
 ### Ego-pose and episodic-memory ablations
 
 ```bash
+# Episodic-memory variant: choose data_dino_episodic_memory at the folder prompt.
 # Drop only the direct ego-pose input; memory still uses pose.
 python scripts/train.py --no-egopose
 
+# Ego-pose variant: choose data_dino_egopose at the folder prompt.
 # Drop episodic attention and its GRU input; retain direct ego-pose.
 python scripts/train.py --no-episodic-memory
 
-# Drop both branches.
+# Baseline: choose data_dino_baseline at the folder prompt. Drop both branches.
 python scripts/train.py --no-egopose --no-episodic-memory
 ```
 
@@ -142,13 +194,20 @@ checkpoint automatically; no ablation flags are needed for those commands.
 
 ```bash
 # ImageNav evaluation
-python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth --task imagenav
+python scripts/eval.py \
+    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
+    --task imagenav 
 
 # Zero-shot ObjectNav (text goal, no GPS)
-python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth --task objectnav
+python scripts/eval.py \
+    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
+    --task objectnav 
 ```
 
 Evaluation logs per-episode path length and shortest path length, with a difficulty breakdown (easy <=3m, medium 3-6m, hard >6m).
+Without `--num_episodes`, it attempts the full split once. Invalid start poses
+are recorded separately and excluded from SR/SPL. A matching `.episodes.json`
+report lists requested, completed, invalid, and unaccounted episode IDs.
 
 ### Metrics
 
@@ -160,14 +219,14 @@ Evaluation logs per-episode path length and shortest path length, with a difficu
 ```bash
 # Single episode, 5 stochastic trials overlaid on AI2-THOR top-down view
 python scripts/visualize_trajectory.py \
-    --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth \
+    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
     --episodes FloorPlan_Val3_2_Apple_6 \
     --episodes_path /path/to/val/episodes \
     --scene_dataset_path /path/to/val
 
 # ObjectNav visualization
 python scripts/visualize_trajectory.py \
-    --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth \
+    --checkpoint data_dino_episodic_memory/checkpoints/checkpoint_000010000384.pth \
     --task objectnav --use_list \
     --episodes_path /path/to/val/episodes \
     --scene_dataset_path /path/to/val
@@ -205,8 +264,6 @@ See2Seek/
 ├── requirements.txt
 └── setup.py
 ```
-
-Startup regression checks: `python -m unittest discover -s checks -p 'test_startup.py' -v`.
 
 ## References
 
